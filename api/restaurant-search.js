@@ -28,11 +28,14 @@
 //      returning real results with no further client changes — same URL as before, same
 //      response shape the client already expects.
 //
-// HOW IT WORKS: FatSecret's OAuth2 uses a client-credentials grant — this backend exchanges
-// your Client ID/Secret for a bearer token (valid 24h, cached across warm invocations of this
-// function so it isn't re-requested on every single search) and then calls the v5 food search
-// endpoint, which — unlike Nutritionix — returns full nutrition data for each result in the
-// SAME call. No second "look up this specific item" request needed.
+// WHY THIS IS A TWO-STEP LOOKUP (search, then a detail call per result), same shape as the
+// old Nutritionix version: FatSecret's newer v5 search endpoint returns full nutrition data
+// in one call, but that endpoint is gated to their paid "Premier" scope and silently fails on
+// a free account (returns an internal error instead of a normal HTTP error, which is its own
+// FatSecret quirk, not something this file can work around). The v1 search endpoint below
+// works on the free tier, but only returns a text description, not structured fields — so a
+// second call to the (free-tier-compatible) food detail endpoint pulls the real numbers for
+// each match, the same two-step shape the Nutritionix version always used.
 //
 // WHAT IT RETURNS: calories, protein, carbs, fat, fiber, and sodium, same as before, plus a
 // genuine improvement over the old Nutritionix backend: FatSecret also returns iron, calcium,
@@ -69,17 +72,25 @@ module.exports = async function handler(req, res) {
   try {
     var token = await getAccessToken(clientId, clientSecret);
 
-    // food_type=brand restricts results to branded/restaurant items only, matching what the
-    // old Nutritionix branded_type=1 filter did.
-    var searchUrl = 'https://platform.fatsecret.com/rest/foods/search/v5?search_expression='
-      + encodeURIComponent(query) + '&food_type=brand&max_results=10&format=json';
+    // v1 search works on the free "Basic" scope (v5 does not - see file-header note). It has
+    // no food_type filter param, so it returns generic and branded foods mixed together; we
+    // filter to food_type === 'Brand' ourselves below to keep only restaurant/branded items.
+    var searchUrl = 'https://platform.fatsecret.com/rest/foods/search/v1?search_expression='
+      + encodeURIComponent(query) + '&max_results=50&format=json';
     var searchResp = await fetch(searchUrl, { headers: { Authorization: 'Bearer ' + token } });
     if (!searchResp.ok) {
       res.status(502).json({ error: 'FatSecret search request failed' });
       return;
     }
     var searchData = await searchResp.json();
-    var foodsWrap = searchData.foods_search && searchData.foods_search.results;
+    if (searchData.error) {
+      // FatSecret returns HTTP 200 with an {error:{...}} body for account/scope problems
+      // (e.g. a Premier-only call on a free account) instead of a normal HTTP error status,
+      // so this has to be checked explicitly rather than relying on searchResp.ok.
+      res.status(502).json({ error: 'FatSecret error: ' + (searchData.error.message || searchData.error.code) });
+      return;
+    }
+    var foodsWrap = searchData.foods;
     var foodsRaw = foodsWrap ? foodsWrap.food : null;
     if (!foodsRaw) {
       res.status(404).json({ error: 'No matching restaurant items found' });
@@ -89,53 +100,73 @@ module.exports = async function handler(req, res) {
     // one-item array when there's only a single match — normalize both shapes.
     var foodsList = Array.isArray(foodsRaw) ? foodsRaw : [foodsRaw];
 
-    var results = foodsList.map(function(food) {
-      var servingsRaw = food.servings && food.servings.serving;
-      if (!servingsRaw) return null;
-      var servings = Array.isArray(servingsRaw) ? servingsRaw : [servingsRaw];
-
-      // Prefer a serving already expressed in grams or ounces so normalizing to per-100g is
-      // exact instead of guessed from a vague "1 serving" description with no weight attached.
-      var serving = servings.filter(function(s) {
-        return s.metric_serving_unit === 'g' || s.metric_serving_unit === 'oz';
-      })[0] || servings[0];
-
-      var grams = null;
-      if (serving.metric_serving_unit === 'g') grams = parseFloat(serving.metric_serving_amount);
-      else if (serving.metric_serving_unit === 'oz') grams = parseFloat(serving.metric_serving_amount) * 28.3495;
-      if (!grams || grams <= 0) grams = 100; // no usable weight on this serving - best effort fallback
-      var factor = 100 / grams;
-
-      var num = function(v) { return (v !== undefined && v !== null && v !== '') ? parseFloat(v) : 0; };
-
-      return {
-        name: food.food_name,
-        brandName: food.brand_name || '',
-        servingName: serving.serving_description || (grams + ' g'),
-        servingGrams: grams,
-        per100: {
-          cal: round1(num(serving.calories) * factor),
-          p: round1(num(serving.protein) * factor),
-          c: round1(num(serving.carbohydrate) * factor),
-          f: round1(num(serving.fat) * factor),
-          fiber: round1(num(serving.fiber) * factor),
-          sodium: round1(num(serving.sodium) * factor),
-          // Bonus over the old Nutritionix backend - see the file-header note above.
-          iron: round1(num(serving.iron) * factor),
-          calcium: round1(num(serving.calcium) * factor),
-          vitA: round1(num(serving.vitamin_a) * factor),
-          vitC: round1(num(serving.vitamin_c) * factor),
-          vitD: round1(num(serving.vitamin_d) * factor)
-        }
-      };
-    }).filter(Boolean);
-
-    if (results.length === 0) {
+    var branded = foodsList.filter(function(f) { return f.food_type === 'Brand'; }).slice(0, 8);
+    if (branded.length === 0) {
       res.status(404).json({ error: 'No matching restaurant items found' });
       return;
     }
 
-    res.status(200).json({ results: results });
+    var results = await Promise.all(branded.map(async function(item) {
+      try {
+        var detailUrl = 'https://platform.fatsecret.com/rest/food/v5?food_id=' + item.food_id + '&format=json';
+        var detailResp = await fetch(detailUrl, { headers: { Authorization: 'Bearer ' + token } });
+        if (!detailResp.ok) return null;
+        var detailData = await detailResp.json();
+        if (detailData.error) return null;
+        var food = detailData.food;
+        if (!food) return null;
+
+        var servingsRaw = food.servings && food.servings.serving;
+        if (!servingsRaw) return null;
+        var servings = Array.isArray(servingsRaw) ? servingsRaw : [servingsRaw];
+
+        // Prefer the standardized "100 g" serving FatSecret gives brand items (serving_id "0")
+        // when present — no conversion math needed, most exact option available. Otherwise
+        // fall back to any serving already expressed in grams or ounces.
+        var serving = servings.filter(function(s) { return s.serving_id === '0'; })[0]
+          || servings.filter(function(s) { return s.metric_serving_unit === 'g' || s.metric_serving_unit === 'oz'; })[0]
+          || servings[0];
+
+        var grams = null;
+        if (serving.metric_serving_unit === 'g') grams = parseFloat(serving.metric_serving_amount);
+        else if (serving.metric_serving_unit === 'oz') grams = parseFloat(serving.metric_serving_amount) * 28.3495;
+        if (!grams || grams <= 0) grams = 100; // no usable weight on this serving - best effort fallback
+        var factor = 100 / grams;
+
+        var num = function(v) { return (v !== undefined && v !== null && v !== '') ? parseFloat(v) : 0; };
+
+        return {
+          name: food.food_name,
+          brandName: food.brand_name || item.brand_name || '',
+          servingName: serving.serving_description || (grams + ' g'),
+          servingGrams: grams,
+          per100: {
+            cal: round1(num(serving.calories) * factor),
+            p: round1(num(serving.protein) * factor),
+            c: round1(num(serving.carbohydrate) * factor),
+            f: round1(num(serving.fat) * factor),
+            fiber: round1(num(serving.fiber) * factor),
+            sodium: round1(num(serving.sodium) * factor),
+            // Bonus over the old Nutritionix backend - see the file-header note above.
+            iron: round1(num(serving.iron) * factor),
+            calcium: round1(num(serving.calcium) * factor),
+            vitA: round1(num(serving.vitamin_a) * factor),
+            vitC: round1(num(serving.vitamin_c) * factor),
+            vitD: round1(num(serving.vitamin_d) * factor)
+          }
+        };
+      } catch (innerErr) {
+        return null;
+      }
+    }));
+
+    var cleanResults = results.filter(Boolean);
+    if (cleanResults.length === 0) {
+      res.status(404).json({ error: 'No matching restaurant items found' });
+      return;
+    }
+
+    res.status(200).json({ results: cleanResults });
   } catch (err) {
     res.status(502).json({ error: 'Restaurant lookup failed' });
   }

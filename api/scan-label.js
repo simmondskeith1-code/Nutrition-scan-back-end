@@ -44,6 +44,7 @@ module.exports = async function handler(req, res) {
     '  "carbs": number,',
     '  "fat": number,',
     '  "fiber": number,',
+    '  "addedSugar": number,',
     '  "iron": number,',
     '  "calcium": number,',
     '  "vitD": number,',
@@ -57,7 +58,8 @@ module.exports = async function handler(req, res) {
     '  "zinc": number,',
     '  "vitK": number',
     '}',
-    'Units: cal in kcal, protein/carbs/fat/iron/calcium/magnesium/vitE/sodium/b6/zinc in mg or g as printed (protein/carbs/fat/sodium/potassium/calcium/magnesium/iron in their standard label units — grams for protein/carbs/fat, milligrams for sodium/calcium/potassium/magnesium/iron), vitD/b12/vitK in mcg.',
+    'Units: cal in kcal, protein/carbs/fat/iron/calcium/magnesium/vitE/sodium/b6/zinc in mg or g as printed (protein/carbs/fat/sodium/potassium/calcium/magnesium/iron in their standard label units, grams for protein/carbs/fat, milligrams for sodium/calcium/potassium/magnesium/iron), vitD/b12/vitK in mcg.',
+    '"addedSugar" is the "Includes Xg Added Sugars" line printed under Total Sugars on US labels, in grams. This is a distinct printed line from "Total Sugars", not the same value, and not something to calculate yourself. If the label has no such line, use null.',
     'If a value is not printed on the label, use null for that field. Do not guess or estimate values that are not shown.',
   ].join('\n');
 
@@ -125,6 +127,7 @@ module.exports = async function handler(req, res) {
       carbs: field('carbs'),
       fat: field('fat'),
       fiber: field('fiber'),
+      addedSugar: field('addedSugar'),
       iron: field('iron'),
       calcium: field('calcium'),
       vitD: field('vitD'),
@@ -143,3 +146,4 @@ module.exports = async function handler(req, res) {
     return res.status(500).json({ error: 'Server error processing image' });
   }
 };
+mm

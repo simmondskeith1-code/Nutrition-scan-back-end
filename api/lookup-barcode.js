@@ -146,6 +146,10 @@ async function tryEdamam(variants) {
         b6: null,
         b12: null,
         zinc: null,
+        // "Added Sugars" is its own line on US Nutrition Facts labels, distinct from total
+        // sugar — Edamam exposes it under this separate nutrient key when the brand submitted
+        // it, so it gets its own scale() call rather than being folded into SUGAR.
+        addedSugar: scale(nutrients['SUGAR.added']),
       };
     } catch (innerErr) {
       console.error('Edamam attempt threw for', code, ':', innerErr);
@@ -216,6 +220,9 @@ async function tryOpenFoodFacts(variants) {
         b6: num(n['vitamin-b6_100g']),
         b12: num(n['vitamin-b12_100g']),
         zinc: num(n.zinc_100g),
+        // Sparse but present on some products — OFF's separate "added sugars" field (distinct
+        // from total sugars_100g), scaled to serving like everything else here.
+        addedSugar: num(n['added-sugars_100g']),
       };
     } catch (innerErr) {
       console.error('Open Food Facts attempt threw for', code, ':', innerErr);
@@ -249,6 +256,7 @@ var FDC_NUTRIENT_NUMBERS = {
   b6: '415',        // Vitamin B-6 (mg)
   b12: '418',       // Vitamin B-12 (mcg)
   zinc: '309',      // Zinc, Zn (mg)
+  addedSugar: '539', // Sugars, added (g) — distinct from total sugars (269)
 };
 
 async function tryFDC(variants) {
@@ -321,6 +329,7 @@ async function tryFDC(variants) {
         b6: num('b6'),
         b12: num('b12'),
         zinc: num('zinc'),
+        addedSugar: num('addedSugar'),
       };
     } catch (innerErr) {
       console.error('FDC attempt threw for', code, ':', innerErr);

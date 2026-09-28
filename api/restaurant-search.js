@@ -1,19 +1,23 @@
 // api/restaurant-search.js
 //
 // Drop this into the same backend project that already serves /api/scan-label and
-// /api/lookup-barcode (nutrition-scan-back-end.vercel.app), replacing the old Nutritionix
-// version. If that project uses a different export style (ESM `export default`, or a
-// framework wrapper), match this logic to that file's existing convention rather than
-// copy-pasting this verbatim.
+// /api/lookup-barcode (nutrition-scan-back-end.vercel.app), replacing whatever version is
+// currently live at this path. If that project uses a different export style (ESM
+// `export default`, or a framework wrapper), match this logic to that file's existing
+// convention rather than copy-pasting this verbatim.
 //
-// WHY FATSECRET INSTEAD OF NUTRITIONIX: Nutritionix closed free self-serve signup — new
-// accounts now require a sales conversation. FatSecret's Platform API still has a real free
-// self-serve tier (register, get keys same-day, 5,000 calls/day, no cost, no sales call) and
-// covers restaurant/branded items the same way Nutritionix did.
+// PREMIER TIER, ONE-CALL SEARCH: this version assumes the FatSecret account has been granted
+// Premier tier and uses foods.search.v3, which returns full structured nutrition for every
+// serving directly in the search response. That replaces the old two-step design (a free-tier
+// v1 search returning only a text description, then a separate food.get detail call per
+// result) with a single call per search. Faster, and roughly 1/9th the API calls for a typical
+// 8-result search. If this account ever drops back to a free/non-Premier tier, this file will
+// start failing (FatSecret gates v3 behind the "premier" OAuth scope) — see the older two-step
+// version in this project's git history if that happens.
 //
 // SETUP REQUIRED before this does anything:
-//   1. You already registered a free FatSecret Platform API account at
-//      https://platform.fatsecret.com/register
+//   1. FatSecret Platform API account with Premier tier granted at
+//      https://platform.fatsecret.com
 //   2. In your FatSecret developer dashboard, create/open your application and copy its
 //      Client ID and Client Secret (FatSecret's older docs sometimes call the same pair
 //      "Consumer Key" / "Consumer Secret" — same credentials, same flow, just older naming).
@@ -22,27 +26,24 @@
 //        FATSECRET_CLIENT_SECRET = <your client secret>
 //      Never put these in the client-side HTML file — that's the entire reason this lookup
 //      goes through a backend instead of calling FatSecret directly from the browser.
-//   4. Redeploy. The client already points at:
+//   4. In the FatSecret dashboard, under API Keys -> Manage -> IP Restriction, whitelist
+//      0.0.0.0/0 (allow any IP) — Vercel serverless functions run from a rotating pool of AWS
+//      addresses, not one fixed IP, so a single-IP or narrow-range whitelist will not work.
+//      FatSecret's own docs say this can take up to 24 hours to take effect.
+//   5. Redeploy. The client already points at:
 //        https://nutrition-scan-back-end.vercel.app/api/restaurant-search?query=...
 //      so once this file is live at that path, the app's Restaurant / Fast Food search starts
 //      returning real results with no further client changes — same URL as before, same
 //      response shape the client already expects.
+//   6. FatSecret's attribution requirement is separate from any of the above and does not get
+//      satisfied by this file alone — it has to be added to (a) the app UI wherever these
+//      results are shown, (b) the site's public pages. See platform.fatsecret.com's
+//      attribution policy for the exact snippet.
 //
-// WHY THIS IS A TWO-STEP LOOKUP (search, then a detail call per result), same shape as the
-// old Nutritionix version: FatSecret's newer v5 search endpoint returns full nutrition data
-// in one call, but that endpoint is gated to their paid "Premier" scope and silently fails on
-// a free account (returns an internal error instead of a normal HTTP error, which is its own
-// FatSecret quirk, not something this file can work around). The v1 search endpoint below
-// works on the free tier, but only returns a text description, not structured fields — so a
-// second call to the (free-tier-compatible) food detail endpoint pulls the real numbers for
-// each match, the same two-step shape the Nutritionix version always used.
-//
-// WHAT IT RETURNS: calories, protein, carbs, fat, fiber, and sodium, same as before, plus a
-// genuine improvement over the old Nutritionix backend: FatSecret also returns iron, calcium,
-// vitamin A, vitamin C, and vitamin D for branded items "where available." That's real bonus
-// micronutrient coverage restaurant-menu data never had before — but "where available" is
-// FatSecret's own wording, meaning it's still frequently 0 for a given item. That's honest
-// missing data, not a bug in this file.
+// WHAT IT RETURNS: calories, protein, carbs, fat, fiber, and sodium, plus (where FatSecret has
+// the data for a given item, still frequently 0 — that's honest missing data, not a bug here)
+// iron, calcium, vitamin A, vitamin C, vitamin D, and now added sugars. Added sugars specifically
+// was never available from the old free-tier two-step version at all; v3 exposes it directly.
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*'); // tighten to your app's real origin once this is confirmed working
@@ -72,10 +73,11 @@ module.exports = async function handler(req, res) {
   try {
     var token = await getAccessToken(clientId, clientSecret);
 
-    // v1 search works on the free "Basic" scope (v5 does not - see file-header note). It has
-    // no food_type filter param, so it returns generic and branded foods mixed together; we
-    // filter to food_type === 'Brand' ourselves below to keep only restaurant/branded items.
-    var searchUrl = 'https://platform.fatsecret.com/rest/foods/search/v1?search_expression='
+    // v3 requires the "premier" OAuth scope (see getAccessToken below) and returns full
+    // nutrition per serving in this one response — no food_type filter param exists, so
+    // generic and branded foods still come back mixed together; filtered to food_type ===
+    // 'Brand' ourselves below to keep only restaurant/branded items.
+    var searchUrl = 'https://platform.fatsecret.com/rest/foods/search/v3?search_expression='
       + encodeURIComponent(query) + '&max_results=50&format=json';
     var searchResp = await fetch(searchUrl, { headers: { Authorization: 'Bearer ' + token } });
     if (!searchResp.ok) {
@@ -85,12 +87,13 @@ module.exports = async function handler(req, res) {
     var searchData = await searchResp.json();
     if (searchData.error) {
       // FatSecret returns HTTP 200 with an {error:{...}} body for account/scope problems
-      // (e.g. a Premier-only call on a free account) instead of a normal HTTP error status,
-      // so this has to be checked explicitly rather than relying on searchResp.ok.
+      // instead of a normal HTTP error status, so this has to be checked explicitly rather
+      // than relying on searchResp.ok. If Premier ever lapses on this account, this is the
+      // error shape that will start showing up here.
       res.status(502).json({ error: 'FatSecret error: ' + (searchData.error.message || searchData.error.code) });
       return;
     }
-    var foodsWrap = searchData.foods;
+    var foodsWrap = searchData.foods_search && searchData.foods_search.results;
     var foodsRaw = foodsWrap ? foodsWrap.food : null;
     if (!foodsRaw) {
       res.status(404).json({ error: 'No matching restaurant items found' });
@@ -106,59 +109,47 @@ module.exports = async function handler(req, res) {
       return;
     }
 
-    var results = await Promise.all(branded.map(async function(item) {
-      try {
-        var detailUrl = 'https://platform.fatsecret.com/rest/food/v5?food_id=' + item.food_id + '&format=json';
-        var detailResp = await fetch(detailUrl, { headers: { Authorization: 'Bearer ' + token } });
-        if (!detailResp.ok) return null;
-        var detailData = await detailResp.json();
-        if (detailData.error) return null;
-        var food = detailData.food;
-        if (!food) return null;
+    var num = function(v) { return (v !== undefined && v !== null && v !== '') ? parseFloat(v) : 0; };
 
-        var servingsRaw = food.servings && food.servings.serving;
-        if (!servingsRaw) return null;
-        var servings = Array.isArray(servingsRaw) ? servingsRaw : [servingsRaw];
+    var results = branded.map(function(food) {
+      var servingsRaw = food.servings && food.servings.serving;
+      if (!servingsRaw) return null;
+      var servings = Array.isArray(servingsRaw) ? servingsRaw : [servingsRaw];
 
-        // Prefer the standardized "100 g" serving FatSecret gives brand items (serving_id "0")
-        // when present — no conversion math needed, most exact option available. Otherwise
-        // fall back to any serving already expressed in grams or ounces.
-        var serving = servings.filter(function(s) { return s.serving_id === '0'; })[0]
-          || servings.filter(function(s) { return s.metric_serving_unit === 'g' || s.metric_serving_unit === 'oz'; })[0]
-          || servings[0];
+      // Prefer the standardized "100 g" serving FatSecret gives brand items (serving_id "0")
+      // when present — no conversion math needed, most exact option available. Otherwise
+      // fall back to any serving already expressed in grams or ounces.
+      var serving = servings.filter(function(s) { return s.serving_id === '0'; })[0]
+        || servings.filter(function(s) { return s.metric_serving_unit === 'g' || s.metric_serving_unit === 'oz'; })[0]
+        || servings[0];
 
-        var grams = null;
-        if (serving.metric_serving_unit === 'g') grams = parseFloat(serving.metric_serving_amount);
-        else if (serving.metric_serving_unit === 'oz') grams = parseFloat(serving.metric_serving_amount) * 28.3495;
-        if (!grams || grams <= 0) grams = 100; // no usable weight on this serving - best effort fallback
-        var factor = 100 / grams;
+      var grams = null;
+      if (serving.metric_serving_unit === 'g') grams = parseFloat(serving.metric_serving_amount);
+      else if (serving.metric_serving_unit === 'oz') grams = parseFloat(serving.metric_serving_amount) * 28.3495;
+      if (!grams || grams <= 0) grams = 100; // no usable weight on this serving - best effort fallback
+      var factor = 100 / grams;
 
-        var num = function(v) { return (v !== undefined && v !== null && v !== '') ? parseFloat(v) : 0; };
-
-        return {
-          name: food.food_name,
-          brandName: food.brand_name || item.brand_name || '',
-          servingName: serving.serving_description || (grams + ' g'),
-          servingGrams: grams,
-          per100: {
-            cal: round1(num(serving.calories) * factor),
-            p: round1(num(serving.protein) * factor),
-            c: round1(num(serving.carbohydrate) * factor),
-            f: round1(num(serving.fat) * factor),
-            fiber: round1(num(serving.fiber) * factor),
-            sodium: round1(num(serving.sodium) * factor),
-            // Bonus over the old Nutritionix backend - see the file-header note above.
-            iron: round1(num(serving.iron) * factor),
-            calcium: round1(num(serving.calcium) * factor),
-            vitA: round1(num(serving.vitamin_a) * factor),
-            vitC: round1(num(serving.vitamin_c) * factor),
-            vitD: round1(num(serving.vitamin_d) * factor)
-          }
-        };
-      } catch (innerErr) {
-        return null;
-      }
-    }));
+      return {
+        name: food.food_name,
+        brandName: food.brand_name || '',
+        servingName: serving.serving_description || (grams + ' g'),
+        servingGrams: grams,
+        per100: {
+          cal: round1(num(serving.calories) * factor),
+          p: round1(num(serving.protein) * factor),
+          c: round1(num(serving.carbohydrate) * factor),
+          f: round1(num(serving.fat) * factor),
+          fiber: round1(num(serving.fiber) * factor),
+          sodium: round1(num(serving.sodium) * factor),
+          addedSugar: round1(num(serving.added_sugars) * factor),
+          iron: round1(num(serving.iron) * factor),
+          calcium: round1(num(serving.calcium) * factor),
+          vitA: round1(num(serving.vitamin_a) * factor),
+          vitC: round1(num(serving.vitamin_c) * factor),
+          vitD: round1(num(serving.vitamin_d) * factor)
+        }
+      };
+    });
 
     var cleanResults = results.filter(Boolean);
     if (cleanResults.length === 0) {
@@ -188,7 +179,11 @@ async function getAccessToken(clientId, clientSecret) {
       'Content-Type': 'application/x-www-form-urlencoded',
       'Authorization': 'Basic ' + basicAuth
     },
-    body: 'grant_type=client_credentials&scope=basic'
+    // foods.search.v3 is gated to the "premier" scope - a plain "basic" token (as the old
+    // free-tier version of this file requested) gets a valid token that then fails on this
+    // specific endpoint with an account/scope error, not an auth error, so the scope has to
+    // be requested correctly here, not caught by retrying the search call.
+    body: 'grant_type=client_credentials&scope=premier'
   });
   if (!resp.ok) throw new Error('FatSecret token request failed');
   var data = await resp.json();

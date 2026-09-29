@@ -81,7 +81,8 @@ module.exports = async function handler(req, res) {
       + encodeURIComponent(query) + '&max_results=50&format=json';
     var searchResp = await fetch(searchUrl, { headers: { Authorization: 'Bearer ' + token } });
     if (!searchResp.ok) {
-      res.status(502).json({ error: 'FatSecret search request failed' });
+      console.error('FATSECRET_SEARCH_HTTP_ERROR', searchResp.status);
+      res.status(502).json({ error: 'Restaurant search is temporarily unavailable. Log it as a Packaged Meal below instead.' });
       return;
     }
     var searchData = await searchResp.json();
@@ -89,8 +90,11 @@ module.exports = async function handler(req, res) {
       // FatSecret returns HTTP 200 with an {error:{...}} body for account/scope problems
       // instead of a normal HTTP error status, so this has to be checked explicitly rather
       // than relying on searchResp.ok. If Premier ever lapses on this account, this is the
-      // error shape that will start showing up here.
-      res.status(502).json({ error: 'FatSecret error: ' + (searchData.error.message || searchData.error.code) });
+      // error shape that will start showing up here. The raw FatSecret error (often internal
+      // jargon like a scope/tier code) goes to the server log only, tagged so it's greppable in
+      // Vercel's logs — a paying member sees a plain, actionable message instead of raw API text.
+      console.error('FATSECRET_AUTH_OR_TIER_ISSUE', searchData.error.code, searchData.error.message);
+      res.status(502).json({ error: 'Restaurant search is temporarily unavailable. Log it as a Packaged Meal below instead.' });
       return;
     }
     var foodsWrap = searchData.foods_search && searchData.foods_search.results;
@@ -159,7 +163,11 @@ module.exports = async function handler(req, res) {
 
     res.status(200).json({ results: cleanResults });
   } catch (err) {
-    res.status(502).json({ error: 'Restaurant lookup failed' });
+    // getAccessToken throwing here almost always means the OAuth token request itself failed —
+    // check this specific log line first if restaurant search ever goes down, since it's the
+    // most likely sign Premier access lapsed (rather than a one-off network blip).
+    console.error('FATSECRET_REQUEST_FAILED', err && err.message);
+    res.status(502).json({ error: 'Restaurant search is temporarily unavailable. Log it as a Packaged Meal below instead.' });
   }
 };
 
@@ -185,7 +193,10 @@ async function getAccessToken(clientId, clientSecret) {
     // be requested correctly here, not caught by retrying the search call.
     body: 'grant_type=client_credentials&scope=premier'
   });
-  if (!resp.ok) throw new Error('FatSecret token request failed');
+  if (!resp.ok) {
+    var bodyText = await resp.text().catch(function() { return ''; });
+    throw new Error('FatSecret token request failed (' + resp.status + '): ' + bodyText);
+  }
   var data = await resp.json();
 
   cachedToken = data.access_token;

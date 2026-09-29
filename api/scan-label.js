@@ -30,6 +30,13 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: 'No image provided' });
   }
 
+  // Anthropic's vision API only accepts these four types. The client now always re-encodes to
+  // JPEG before uploading (iPhones frequently hand over HEIC/HEIF, which isn't supported and
+  // used to 400 here with no indication why), but this guards against any other client path —
+  // past or future — sending something else through instead of trusting the caller blindly.
+  const SUPPORTED_MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+  const safeMediaType = SUPPORTED_MEDIA_TYPES.includes(mediaType) ? mediaType : 'image/jpeg';
+
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     return res.status(500).json({ error: 'Server misconfigured: missing API key' });
@@ -82,7 +89,7 @@ module.exports = async function handler(req, res) {
                 type: 'image',
                 source: {
                   type: 'base64',
-                  media_type: mediaType || 'image/jpeg',
+                  media_type: safeMediaType,
                   data: imageBase64,
                 },
               },
@@ -146,4 +153,3 @@ module.exports = async function handler(req, res) {
     return res.status(500).json({ error: 'Server error processing image' });
   }
 };
-mm

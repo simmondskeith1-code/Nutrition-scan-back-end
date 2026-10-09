@@ -3,8 +3,28 @@
 //   GUMROAD_PRODUCT_ID  (from the book's Gumroad product page, License key section)
 //   ADMIN_KEY           (any long secret you choose; unlocks the widget for you)
 // Optional:
+//   BOOK_COMP_KEYS      (comma-separated free-access codes for clients, guests, reviewers.
+//                        Each code must be at least 12 characters. Remove a code to revoke it.)
 //   ALLOWED_ORIGIN      (defaults to *)
 //   MAX_USES            (devices per license key, defaults to 5)
+
+const crypto = require("crypto");
+
+// Compares two strings without leaking how many leading characters matched.
+function same(a, b) {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  if (x.length !== y.length) return false;
+  return crypto.timingSafeEqual(x, y);
+}
+
+// Reads BOOK_COMP_KEYS, trims each code and drops anything too short to be safe.
+function compKeys() {
+  return String(process.env.BOOK_COMP_KEYS || "")
+    .split(",")
+    .map(function (k) { return k.trim(); })
+    .filter(function (k) { return k.length >= 12; });
+}
 
 module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", process.env.ALLOWED_ORIGIN || "*");
@@ -21,7 +41,13 @@ module.exports = async function handler(req, res) {
   if (!key) return res.status(400).json({ ok: false, error: "Paste your license key first." });
 
   const admin = process.env.ADMIN_KEY;
-  if (admin && key === admin) return res.status(200).json({ ok: true, admin: true });
+  if (admin && same(key, admin)) return res.status(200).json({ ok: true, admin: true });
+
+  // Free-access codes you hand out yourself. They skip Gumroad entirely.
+  const comps = compKeys();
+  for (let i = 0; i < comps.length; i++) {
+    if (same(key, comps[i])) return res.status(200).json({ ok: true, comp: true });
+  }
 
   const productId = process.env.GUMROAD_PRODUCT_ID;
   if (!productId) return res.status(500).json({ ok: false, error: "Server not configured." });

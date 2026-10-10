@@ -1854,32 +1854,6 @@
 "addedSugar": 28.5
 },
 {
-"spot": "Hearthly Burger",
-"name": "Add bacon",
-"servingName": "2 strips",
-"servingGrams": 16,
-"cal": 86,
-"p": 5.9,
-"c": 0.2,
-"f": 6.7,
-"fiber": 0.0,
-"sodium": 272,
-"addedSugar": 0.0
-},
-{
-"spot": "Hearthly Burger",
-"name": "Add avocado",
-"servingName": "1 portion",
-"servingGrams": 50,
-"cal": 80,
-"p": 1.0,
-"c": 4.2,
-"f": 7.5,
-"fiber": 3.4,
-"sodium": 4,
-"addedSugar": 0.0
-},
-{
 "spot": "The Greek Spot",
 "name": "Chicken Bowl",
 "servingName": "1 bowl",

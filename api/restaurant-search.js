@@ -51,10 +51,27 @@
 // its items to that file and redeploy. No tracker change needed.
 var LOCAL = require('../data/local-spots.json');
 function norm(s) { return String(s || '').toLowerCase().replace(/['\u2019]/g, '').replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim(); }
-var LOCAL_INDEX = LOCAL.items.map(function(it) {
+var ADDONS_BY_SPOT = {};
+LOCAL.items.forEach(function(it) {
+  if (it.name.indexOf('Add-on: ') !== 0) return;
+  (ADDONS_BY_SPOT[it.spot] = ADDONS_BY_SPOT[it.spot] || []).push(it);
+});
+// Add-ons are offered as toppings on the matching dish, not as standalone search results.
+var LOCAL_INDEX = LOCAL.items.filter(function(it) { return it.name.indexOf('Add-on: ') !== 0; }).map(function(it) {
   var spot = LOCAL.spots[it.spot] || {};
   return { it: it, spotText: ' ' + norm([it.spot].concat(spot.aliases || []).join(' ')) + ' ', text: ' ' + norm(it.name) + ' ' };
 });
+// "on 1 slice of a 12-inch pie" add-ons only fit that exact slice; "1 portion" add-ons fit any non-slice dish.
+function addonsFor(it) {
+  var list = ADDONS_BY_SPOT[it.spot] || [];
+  var isSlice = /slice/.test(it.servingName);
+  return list.filter(function(a) {
+    if (a.servingName === '1 portion') return !isSlice;
+    return a.servingName === 'on ' + it.servingName;
+  }).map(function(a) {
+    return { name: a.name.replace('Add-on: ', ''), cal: a.cal, p: a.p, c: a.c, f: a.f, fiber: a.fiber, sodium: a.sodium, addedSugar: a.addedSugar };
+  });
+}
 function localSearch(query) {
   var words = norm(query).split(' ').filter(Boolean);
   if (!words.length) return [];
@@ -76,6 +93,7 @@ function localSearch(query) {
       servingName: it.servingName,
       servingGrams: it.servingGrams,
       estimated: true,
+      addons: addonsFor(it),
       per100: {
         cal: round1(it.cal * f), p: round1(it.p * f), c: round1(it.c * f), f: round1(it.f * f),
         fiber: round1(it.fiber * f), sodium: round1(it.sodium * f), addedSugar: round1(it.addedSugar * f),
@@ -170,11 +188,12 @@ async function handler(req, res) {
       if (!servingsRaw) return null;
       var servings = Array.isArray(servingsRaw) ? servingsRaw : [servingsRaw];
 
-      // Prefer the standardized "100 g" serving FatSecret gives brand items (serving_id "0")
-      // when present — no conversion math needed, most exact option available. Otherwise
-      // fall back to any serving already expressed in grams or ounces.
-      var serving = servings.filter(function(s) { return s.serving_id === '0'; })[0]
-        || servings.filter(function(s) { return s.metric_serving_unit === 'g' || s.metric_serving_unit === 'oz'; })[0]
+      // Prefer the real menu serving (FatSecret's default, e.g. "1 sandwich") so the member logs what
+      // they actually ate. The standardized 100 g serving (serving_id "0") is only a fallback.
+      var hasWeight = function(s) { return (s.metric_serving_unit === 'g' || s.metric_serving_unit === 'oz') && parseFloat(s.metric_serving_amount) > 0; };
+      var serving = servings.filter(function(s) { return s.is_default === '1' && hasWeight(s); })[0]
+        || servings.filter(function(s) { return s.serving_id !== '0' && hasWeight(s); })[0]
+        || servings.filter(function(s) { return s.serving_id === '0'; })[0]
         || servings[0];
 
       var grams = null;

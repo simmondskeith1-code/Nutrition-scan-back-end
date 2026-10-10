@@ -45,7 +45,7 @@
 // iron, calcium, vitamin A, vitamin C, vitamin D, and now added sugars. Added sugars specifically
 // was never available from the old free-tier two-step version at all; v3 exposes it directly.
 
-// LOCAL SPOTS: small Monmouth County restaurants that publish no nutrition facts. Their items live
+// LOCAL SPOTS: small local restaurants (Monmouth County, Atlantic City, Gilroy area) that publish no nutrition facts. Their items live
 // in data/local-spots.json as estimates (USDA ingredient data + typical portions), and are returned
 // first, ahead of FatSecret, in the same shape the tracker already reads. To add a restaurant, add
 // its items to that file and redeploy. No tracker change needed.
@@ -69,7 +69,7 @@ function addonsFor(it) {
     if (a.servingName === '1 portion') return !isSlice;
     return a.servingName === 'on ' + it.servingName;
   }).map(function(a) {
-    return { name: a.name.replace('Add-on: ', ''), cal: a.cal, p: a.p, c: a.c, f: a.f, fiber: a.fiber, sodium: a.sodium, addedSugar: a.addedSugar };
+    return Object.assign({ name: a.name.replace('Add-on: ', ''), cal: a.cal, p: a.p, c: a.c, f: a.f, fiber: a.fiber, sodium: a.sodium, addedSugar: a.addedSugar }, a.m || {});
   });
 }
 function localSearch(query) {
@@ -87,6 +87,9 @@ function localSearch(query) {
   });
   return hits.slice(0, 40).map(function(x) {
     var it = x.it, f = 100 / it.servingGrams;
+    // Micronutrients: estimated from each ingredient's USDA values (same food data the tracker uses).
+    var micro = {};
+    Object.keys(it.m || {}).forEach(function(k) { micro[k] = Math.round(it.m[k] * f * 100) / 100; });
     return {
       name: it.name,
       brandName: it.spot + ' (local, estimated)',
@@ -94,11 +97,10 @@ function localSearch(query) {
       servingGrams: it.servingGrams,
       estimated: true,
       addons: addonsFor(it),
-      per100: {
+      per100: Object.assign({ iron: 0, calcium: 0, vitA: 0, vitC: 0, vitD: 0 }, micro, {
         cal: round1(it.cal * f), p: round1(it.p * f), c: round1(it.c * f), f: round1(it.f * f),
-        fiber: round1(it.fiber * f), sodium: round1(it.sodium * f), addedSugar: round1(it.addedSugar * f),
-        iron: 0, calcium: 0, vitA: 0, vitC: 0, vitD: 0
-      }
+        fiber: round1(it.fiber * f), sodium: round1(it.sodium * f), addedSugar: round1(it.addedSugar * f)
+      })
     };
   });
 }
@@ -219,7 +221,8 @@ async function handler(req, res) {
           calcium: round1(num(serving.calcium) * factor),
           vitA: round1(num(serving.vitamin_a) * factor),
           vitC: round1(num(serving.vitamin_c) * factor),
-          vitD: round1(num(serving.vitamin_d) * factor)
+          vitD: round1(num(serving.vitamin_d) * factor),
+          potassium: round1(num(serving.potassium) * factor)
         }
       };
     });

@@ -45,7 +45,47 @@
 // iron, calcium, vitamin A, vitamin C, vitamin D, and now added sugars. Added sugars specifically
 // was never available from the old free-tier two-step version at all; v3 exposes it directly.
 
-module.exports = async function handler(req, res) {
+// LOCAL SPOTS: small Monmouth County restaurants that publish no nutrition facts. Their items live
+// in data/local-spots.json as estimates (USDA ingredient data + typical portions), and are returned
+// first, ahead of FatSecret, in the same shape the tracker already reads. To add a restaurant, add
+// its items to that file and redeploy. No tracker change needed.
+var LOCAL = require('../data/local-spots.json');
+function norm(s) { return String(s || '').toLowerCase().replace(/['\u2019]/g, '').replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim(); }
+var LOCAL_INDEX = LOCAL.items.map(function(it) {
+  var spot = LOCAL.spots[it.spot] || {};
+  return { it: it, spotText: ' ' + norm([it.spot].concat(spot.aliases || []).join(' ')) + ' ', text: ' ' + norm(it.name) + ' ' };
+});
+function localSearch(query) {
+  var words = norm(query).split(' ').filter(Boolean);
+  if (!words.length) return [];
+  var hits = LOCAL_INDEX.filter(function(x) {
+    var all = x.spotText + x.text;
+    return words.every(function(w) { return all.indexOf(w) > -1; });
+  });
+  // Items whose own name matches the query rank above items that only match the restaurant name.
+  hits.sort(function(a, b) {
+    var sa = words.filter(function(w) { return a.text.indexOf(w) > -1; }).length;
+    var sb = words.filter(function(w) { return b.text.indexOf(w) > -1; }).length;
+    return sb - sa;
+  });
+  return hits.slice(0, 40).map(function(x) {
+    var it = x.it, f = 100 / it.servingGrams;
+    return {
+      name: it.name,
+      brandName: it.spot + ' (local, estimated)',
+      servingName: it.servingName,
+      servingGrams: it.servingGrams,
+      estimated: true,
+      per100: {
+        cal: round1(it.cal * f), p: round1(it.p * f), c: round1(it.c * f), f: round1(it.f * f),
+        fiber: round1(it.fiber * f), sodium: round1(it.sodium * f), addedSugar: round1(it.addedSugar * f),
+        iron: 0, calcium: 0, vitA: 0, vitC: 0, vitD: 0
+      }
+    };
+  });
+}
+
+async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*'); // tighten to your app's real origin once this is confirmed working
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   if (req.method === 'OPTIONS') {
@@ -60,6 +100,16 @@ module.exports = async function handler(req, res) {
   var query = (req.query && req.query.query ? String(req.query.query) : '').trim();
   if (!query) {
     res.status(400).json({ error: 'Missing query parameter' });
+    return;
+  }
+
+  var local = req.query.skipLocal ? [] : localSearch(query);
+  if (local.length) {
+    // Local matches first. FatSecret is still asked for chain results, but any failure there
+    // just means the member sees the local items alone.
+    var fsResults = [];
+    try { fsResults = await fatsecretSearch(query); } catch (e) { console.error('FATSECRET_WITH_LOCAL_FAILED', e && e.message); }
+    res.status(200).json({ results: local.concat(fsResults) });
     return;
   }
 
@@ -169,7 +219,25 @@ module.exports = async function handler(req, res) {
     console.error('FATSECRET_REQUEST_FAILED', err && err.message);
     res.status(502).json({ error: 'Restaurant search is temporarily unavailable. Log it as a Packaged Meal below instead.' });
   }
-};
+}
+module.exports = handler;
+
+// Runs the FatSecret path above without sending a response, so local results can be combined with it.
+function fatsecretSearch(query) {
+  return new Promise(function(resolve, reject) {
+    var fake = {
+      code: 200,
+      setHeader: function() {}, end: function() {},
+      status: function(c) { this.code = c; return this; },
+      json: function(j) {
+        if (this.code === 200) resolve((j && j.results) || []);
+        else if (this.code === 404) resolve([]);
+        else reject(new Error((j && j.error) || ('status ' + this.code)));
+      }
+    };
+    handler({ method: 'GET', query: { query: query, skipLocal: '1' } }, fake).catch(reject);
+  });
+}
 
 // Cached at module scope so a warm serverless instance reuses the same token across requests
 // instead of hitting the OAuth endpoint on every single search - tokens are valid 24h.

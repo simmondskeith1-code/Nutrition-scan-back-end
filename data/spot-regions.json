@@ -1,0 +1,28 @@
+{
+ "note": "Approximate area centers, used only to order and trim local results by distance from the member. Spots not listed here are shown without a distance boost.",
+ "regions": {
+  "monmouth": [40.25, -74.15], "atlantic-city": [39.364, -74.423], "gilroy": [37.006, -121.568],
+  "manhattan": [40.78, -73.97], "brooklyn": [40.65, -73.95], "queens": [40.73, -73.80],
+  "bronx": [40.85, -73.87], "staten-island": [40.58, -74.15], "middlesex": [40.49, -74.45],
+  "ocean": [40.09, -74.07], "somerset": [40.57, -74.61], "princeton": [40.357, -74.667]
+ },
+ "spots": {
+  "Tino's Artisan Pizza": "monmouth", "Hearthly Burger": "monmouth", "The Greek Spot": "monmouth",
+  "Kunya Siam Thai": "monmouth", "Nicholas Creamery": "monmouth", "Griffy's Organics": "monmouth",
+  "Rooney's Oceanfront": "monmouth", "Charley's Ocean Grill": "monmouth", "Bahrs Landing": "monmouth",
+  "Drew's Bayshore Bistro": "monmouth", "Federici's": "monmouth", "Pascal & Sabine": "monmouth",
+  "Barrio Costero": "monmouth", "Talula's": "monmouth",
+  "Kelsey's": "atlantic-city", "Tony's Baltimore Grill": "atlantic-city", "Dock's Oyster House": "atlantic-city",
+  "Chef Vola's": "atlantic-city", "Angelo's Fairmount Tavern": "atlantic-city", "Knife & Fork Inn": "atlantic-city",
+  "White House Subs": "atlantic-city",
+  "Gilroy Noodle": "gilroy", "Ninja Sushi": "gilroy", "Pineapple Village": "gilroy",
+  "Mr. Hong's Chinese Fast Food": "gilroy", "Blazin' Bagelz": "gilroy",
+  "Katz's Delicatessen": "manhattan", "Joe's Pizza": "manhattan", "Los Tacos No. 1": "manhattan", "Lombardi's Pizza": "manhattan",
+  "L&B Spumoni Gardens": "brooklyn", "Junior's Restaurant": "brooklyn", "Dominick's Pizza": "brooklyn",
+  "Sripraphai": "queens", "Sac's Place": "queens",
+  "Zero Otto Nove": "bronx", "Louie & Ernie's Pizza": "bronx",
+  "Joe & Pat's": "staten-island", "Denino's Pizzeria & Tavern": "staten-island", "Brother's Pizzeria": "staten-island",
+  "Stuff Yer Face": "middlesex", "Alfonso's Family Trattoria": "somerset", "Jack Baker's Wharfside": "ocean",
+  "Hoagie Haven": "princeton", "Mamoun's Falafel": "princeton"
+ }
+}

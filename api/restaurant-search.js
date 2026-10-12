@@ -72,37 +72,88 @@ function addonsFor(it) {
     return Object.assign({ name: a.name.replace('Add-on: ', ''), cal: a.cal, p: a.p, c: a.c, f: a.f, fiber: a.fiber, sodium: a.sodium, addedSugar: a.addedSugar }, a.m || {});
   });
 }
-function localSearch(query) {
+// Approximate area centers (data/spot-regions.json). Used to order and trim local results by how far the
+// member is from each restaurant's area. Restaurants with no area listed are never boosted or hidden.
+var REGION_DATA = require('../data/spot-regions.json');
+function kmBetween(lat1, lng1, lat2, lng2) {
+  var r = Math.PI / 180, dLat = (lat2 - lat1) * r, dLng = (lng2 - lng1) * r;
+  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+function spotKm(spotName, loc) {
+  if (!loc) return null;
+  var c = REGION_DATA.regions[REGION_DATA.spots[spotName]];
+  return c ? kmBetween(loc.lat, loc.lng, c[0], c[1]) : null;
+}
+var GENERIC_PER_SPOT = 3;   // a broad search ("pizza") shows at most this many dishes per restaurant
+var GENERIC_TOTAL = 18;     // ...and at most this many local dishes overall, so chain results stay visible
+var NEARBY_KM = 120;        // with location on, a broad search hides local spots farther than this
+function mapLocal(x) {
+  var it = x.it, f = 100 / it.servingGrams;
+  // Micronutrients: estimated from each ingredient's USDA values (same food data the tracker uses).
+  var micro = {};
+  Object.keys(it.m || {}).forEach(function(k) { micro[k] = Math.round(it.m[k] * f * 100) / 100; });
+  return {
+    name: it.name,
+    brandName: it.spot + ' (local, estimated)',
+    servingName: it.servingName,
+    servingGrams: it.servingGrams,
+    estimated: true,
+    addons: addonsFor(it),
+    per100: Object.assign({ iron: 0, calcium: 0, vitA: 0, vitC: 0, vitD: 0 }, micro, {
+      cal: round1(it.cal * f), p: round1(it.p * f), c: round1(it.c * f), f: round1(it.f * f),
+      fiber: round1(it.fiber * f), sodium: round1(it.sodium * f), addedSugar: round1(it.addedSugar * f)
+    })
+  };
+}
+function localSearch(query, loc) {
   var words = norm(query).split(' ').filter(Boolean);
   if (!words.length) return [];
   var hits = LOCAL_INDEX.filter(function(x) {
     var all = x.spotText + x.text;
     return words.every(function(w) { return all.indexOf(w) > -1; });
   });
-  // Items whose own name matches the query rank above items that only match the restaurant name.
-  hits.sort(function(a, b) {
-    var sa = words.filter(function(w) { return a.text.indexOf(w) > -1; }).length;
-    var sb = words.filter(function(w) { return b.text.indexOf(w) > -1; }).length;
-    return sb - sa;
+  if (!hits.length) return [];
+  function score(x) { return words.filter(function(w) { return x.text.indexOf(w) > -1; }).length; }
+  // A search that names a restaurant (every word is in its name/aliases, e.g. "katzs") lists that
+  // restaurant's whole menu. Anything else is a broad dish search and gets capped and ranked.
+  var nameMatch = function(x) { return words.every(function(w) { return x.spotText.indexOf(w) > -1; }); };
+  var nameSpots = {};
+  hits.forEach(function(x) { if (nameMatch(x)) nameSpots[x.it.spot] = true; });
+  // Only a search that points at one or two restaurants counts as "naming" one. A word like "pizza" sits in
+  // many restaurant names, so that search stays a broad dish search.
+  var isNamed = Object.keys(nameSpots).length > 0 && Object.keys(nameSpots).length <= 2;
+  var named = [], broad = [];
+  hits.forEach(function(x) { (isNamed && nameSpots[x.it.spot] ? named : broad).push(x); });
+  named.sort(function(a, b) { return score(b) - score(a); });
+  if (loc) {
+    // Hide far-away spots only when the member is actually near some local spot; otherwise show everything.
+    var anyNear = broad.some(function(x) { var d = spotKm(x.it.spot, loc); return d !== null && d <= NEARBY_KM; });
+    if (anyNear) broad = broad.filter(function(x) { var d = spotKm(x.it.spot, loc); return d === null || d <= NEARBY_KM; });
+  }
+  var groups = {}, order = [];
+  broad.forEach(function(x) {
+    var g = groups[x.it.spot];
+    if (!g) { g = groups[x.it.spot] = { spot: x.it.spot, items: [], km: spotKm(x.it.spot, loc) }; order.push(g); }
+    g.items.push(x);
   });
-  return hits.slice(0, 40).map(function(x) {
-    var it = x.it, f = 100 / it.servingGrams;
-    // Micronutrients: estimated from each ingredient's USDA values (same food data the tracker uses).
-    var micro = {};
-    Object.keys(it.m || {}).forEach(function(k) { micro[k] = Math.round(it.m[k] * f * 100) / 100; });
-    return {
-      name: it.name,
-      brandName: it.spot + ' (local, estimated)',
-      servingName: it.servingName,
-      servingGrams: it.servingGrams,
-      estimated: true,
-      addons: addonsFor(it),
-      per100: Object.assign({ iron: 0, calcium: 0, vitA: 0, vitC: 0, vitD: 0 }, micro, {
-        cal: round1(it.cal * f), p: round1(it.p * f), c: round1(it.c * f), f: round1(it.f * f),
-        fiber: round1(it.fiber * f), sodium: round1(it.sodium * f), addedSugar: round1(it.addedSugar * f)
-      })
-    };
+  order.forEach(function(g) {
+    g.items.sort(function(a, b) { return score(b) - score(a); });
+    g.best = score(g.items[0]);
   });
+  order.sort(function(a, b) {
+    if (b.best !== a.best) return b.best - a.best;
+    var da = a.km === null ? 1e9 : a.km, db = b.km === null ? 1e9 : b.km;
+    return da - db;
+  });
+  // Round-robin across restaurants so one restaurant can't fill every slot.
+  var picked = [];
+  for (var round = 0; round < GENERIC_PER_SPOT && picked.length < GENERIC_TOTAL; round++) {
+    for (var i = 0; i < order.length && picked.length < GENERIC_TOTAL; i++) {
+      if (order[i].items[round]) picked.push(order[i].items[round]);
+    }
+  }
+  return named.slice(0, 40).concat(picked).map(mapLocal);
 }
 
 async function handler(req, res) {
@@ -123,12 +174,19 @@ async function handler(req, res) {
     return;
   }
 
-  var local = req.query.skipLocal ? [] : localSearch(query);
+  // Optional member location (rounded by the app to about 1 km). Used only to order this one response;
+  // it is never stored or logged.
+  var loc = null;
+  var la = parseFloat(req.query.lat), ln = parseFloat(req.query.lng);
+  if (isFinite(la) && isFinite(ln) && Math.abs(la) <= 90 && Math.abs(ln) <= 180) loc = { lat: la, lng: ln };
+
+  var local = req.query.skipLocal ? [] : localSearch(query, loc);
   if (local.length) {
-    // Local matches first. FatSecret is still asked for chain results, but any failure there
-    // just means the member sees the local items alone.
+    // Local matches first. FatSecret is still asked for chain results, but a failure or a slow reply
+    // just means the member sees the local items alone, so a slow FatSecret can never hold up local results.
     var fsResults = [];
-    try { fsResults = await fatsecretSearch(query); } catch (e) { console.error('FATSECRET_WITH_LOCAL_FAILED', e && e.message); }
+    try { fsResults = await withTimeout(cachedFatsecret(query), FATSECRET_WAIT_MS); } catch (e) { console.error('FATSECRET_WITH_LOCAL_FAILED', e && e.message); }
+    res.setHeader('Cache-Control', 'public, s-maxage=600, stale-while-revalidate=3600');
     res.status(200).json({ results: local.concat(fsResults) });
     return;
   }
@@ -243,6 +301,24 @@ async function handler(req, res) {
   }
 }
 module.exports = handler;
+
+// Speed: repeat searches are answered from memory for 10 minutes, and a slow FatSecret reply is cut off.
+var FATSECRET_WAIT_MS = 3500;
+var FS_CACHE = new Map();
+function cachedFatsecret(query) {
+  var key = norm(query), hit = FS_CACHE.get(key);
+  if (hit && Date.now() - hit.t < 600000) return Promise.resolve(hit.v);
+  return fatsecretSearch(query).then(function(v) {
+    if (FS_CACHE.size > 300) FS_CACHE.delete(FS_CACHE.keys().next().value);
+    FS_CACHE.set(key, { t: Date.now(), v: v });
+    return v;
+  });
+}
+function withTimeout(promise, ms) {
+  var timer;
+  var timeout = new Promise(function(_, rej) { timer = setTimeout(function() { rej(new Error('FatSecret timed out')); }, ms); });
+  return Promise.race([promise, timeout]).then(function(v) { clearTimeout(timer); return v; }, function(e) { clearTimeout(timer); throw e; });
+}
 
 // Runs the FatSecret path above without sending a response, so local results can be combined with it.
 function fatsecretSearch(query) {

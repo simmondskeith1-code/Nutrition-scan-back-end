@@ -50,7 +50,8 @@ const PROMPT = [
   '  "foods": [',
   '    { "name": string, "grams": number, "gramsLow": number, "gramsHigh": number, "confidence": "high" | "medium" | "low", "basis": string }',
   '  ],',
-  '  "note": string | null',
+  '  "note": string | null,',
+  '  "questions": [ { "q": string, "options": [string, string] } ]',
   '}',
   'Rules:',
   '- "grams" is your single best estimate. "gramsLow" and "gramsHigh" are a realistic range (tighter when you can see the food clearly, wider when it is hidden, stacked or the scale is unclear).',
@@ -60,6 +61,7 @@ const PROMPT = [
   '- If the photo is not food, set isFood to false and foods to an empty array.',
   '- "note" is one short sentence only if something affects accuracy (hidden food, mixed dish, unclear scale, dark photo); otherwise null.',
   '- Maximum 14 items, largest portions first.',
+  '- "questions": up to 3 short follow-up questions for the member, ONLY about things you cannot see that would move calories or macros by more than about 10 percent: cooking method or oil/butter used, sauces and dressings, cheese amount, sugar or milk in a drink, what is inside a wrap or casserole, or a portion hidden under other food. Each has 2 to 4 short concrete answer options (for example "Pan fried in oil", "Grilled, no oil"). Never ask what the photo or the member note already answers. Use an empty array if nothing material is unclear.',
 ].join('\n');
 
 function extractJson(text) {
@@ -100,6 +102,7 @@ module.exports = async function handler(req, res) {
   }
   if (!list.length) return res.status(400).json({ error: 'No image provided' });
 
+  const estimateMode = body.mode === 'estimate';
   const hint = typeof body.hint === 'string' ? body.hint.replace(/\s+/g, ' ').trim().slice(0, 300) : '';
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -136,6 +139,48 @@ module.exports = async function handler(req, res) {
     const data = await response.json();
     const textBlock = (data.content || []).find((b) => b.type === 'text');
     return textBlock ? extractJson(textBlock.text) : null;
+  }
+
+  // Phase 2 (only for foods the tracker's list could not match): nutrition for the portion in THIS photo,
+  // as it appears (visible oil, sauce, breading, cooking method), not a generic 100 g figure.
+  if (estimateMode) {
+    const M = require('../lib/micro-estimate.js');
+    const asked = (Array.isArray(body.foods) ? body.foods : []).slice(0, 14)
+      .map((f) => ({ name: String(f && f.name || '').slice(0, 80), grams: Math.round(num(f && f.grams)), basis: String(f && f.basis || '').slice(0, 80) }))
+      .filter((f) => f.name && f.grams > 0 && f.grams <= MAX_ITEM_G);
+    if (!asked.length) return res.status(400).json({ error: 'No foods to estimate' });
+    const keys = M.KEYS.concat(['cal', 'p', 'c', 'f', 'fiber', 'sodium', 'addedSugar']);
+    const ecContent = content.slice(0, -1).concat([{ type: 'text', text: [
+      'Using the photo(s), estimate the nutrition of each food below for the PORTION shown, at the weight given. Account for what is visible: oil sheen, sauce, breading, cheese, cooking method. Add the member note if present.',
+      'Return ONLY JSON, no fences: {"items":[{"i":0,"v":{' + keys.map((k) => '"' + k + '":number').join(',') + '}}]}',
+      'Units: cal kcal; p, c, f, fiber, addedSugar g; sodium mg; ' + M.KEYS.map((k) => k + ' ' + M.UNITS[k]).join('; ') + '. Values are for the whole portion, not per 100 g. Use realistic non-zero values where the food has them.',
+      '',
+      asked.map((f, i) => i + '. ' + f.name + ' | ' + f.grams + ' g' + (f.basis ? ' | ' + f.basis : '')).join('\n'),
+      hint ? '\nMember note (trust this): ' + hint : '',
+    ].join('\n') }]);
+    try {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: MODEL, max_tokens: 400 + asked.length * 420, messages: [{ role: 'user', content: ecContent }] }),
+      });
+      if (!r.ok) { console.error('Photo estimate HTTP', r.status); return res.status(502).json({ error: 'Estimate unavailable' }); }
+      const d = await r.json();
+      const tb = (d.content || []).find((b) => b.type === 'text');
+      const parsedE = tb ? extractJson(tb.text) : null;
+      const estimates = [];
+      ((parsedE && parsedE.items) || []).forEach((row) => {
+        const f = asked[row.i];
+        if (!f || !row.v || !(Number(row.v.cal) >= 0)) return;
+        const v = {};
+        keys.forEach((k) => { const n = Number(row.v[k]); v[k] = isFinite(n) && n >= 0 ? Math.round(n * 100) / 100 : 0; });
+        estimates.push({ name: f.name, grams: f.grams, v });
+      });
+      return res.status(200).json({ estimates, perPortion: true });
+    } catch (err) {
+      console.error('Photo estimate error:', err);
+      return res.status(502).json({ error: 'Estimate unavailable' });
+    }
   }
 
   try {
@@ -179,26 +224,20 @@ module.exports = async function handler(req, res) {
     const foods = Array.from(seen.values()).sort((a, b) => b.grams - a.grams).slice(0, 14);
 
     let note = typeof parsed.note === 'string' ? parsed.note.slice(0, 200) : null;
+    const questions = (Array.isArray(parsed.questions) ? parsed.questions : []).slice(0, 3).map((q) => ({
+      q: q && typeof q.q === 'string' ? q.q.trim().slice(0, 120) : '',
+      options: Array.isArray(q && q.options) ? q.options.filter((o) => typeof o === 'string' && o.trim()).slice(0, 4).map((o) => o.trim().slice(0, 40)) : [],
+    })).filter((q) => q.q && q.options.length >= 2);
     const totalG = foods.reduce((s, f) => s + f.grams, 0);
     if (totalG > 2500) note = (note ? note + ' ' : '') + 'That is a very large total. Check the grams.';
-
-    // Per-100 g calories, macros and all 20 micronutrients for every food, so a food the tracker's own list
-    // does not have can still be logged with complete numbers (flagged as an estimate in the app).
-    try {
-      const M = require('../lib/micro-estimate.js');
-      const est = await M.estimate(foods.map((f) => ({ name: f.name, context: 'as eaten, per 100 g', grams: 100, need: M.KEYS, needMacros: true })), { timeoutMs: 7000 });
-      est.forEach((e, i) => {
-        if (!e || !e.macros || !(e.macros.cal >= 0)) return;
-        foods[i].est = Object.assign({ cal: 0, p: 0, c: 0, f: 0, fiber: 0, sodium: 0, addedSugar: 0 }, e.macros, e.micros);
-      });
-    } catch (e) { console.error('Photo estimate failed:', e && e.message); }
 
     return res.status(200).json({
       isFood: parsed.isFood !== false && foods.length > 0,
       mealName: typeof parsed.mealName === 'string' ? parsed.mealName.slice(0, 60) : '',
       foods,
       note,
-      version: 2,
+      questions,
+      version: 3,
     });
   } catch (err) {
     console.error('analyze-food-photo error:', err);

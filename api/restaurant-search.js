@@ -50,6 +50,7 @@
 // first, ahead of FatSecret, in the same shape the tracker already reads. To add a restaurant, add
 // its items to that file and redeploy. No tracker change needed.
 var LOCAL = require('../data/local-spots.json');
+var MICRO = require('../lib/micro-estimate.js');
 function norm(s) { return String(s || '').toLowerCase().replace(/['\u2019]/g, '').replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim(); }
 var ADDONS_BY_SPOT = {};
 LOCAL.items.forEach(function(it) {
@@ -100,11 +101,21 @@ function mapLocal(x) {
     servingGrams: it.servingGrams,
     estimated: true,
     addons: addonsFor(it),
-    per100: Object.assign({ iron: 0, calcium: 0, vitA: 0, vitC: 0, vitD: 0 }, micro, {
+    per100: Object.assign({}, micro, {
       cal: round1(it.cal * f), p: round1(it.p * f), c: round1(it.c * f), f: round1(it.f * f),
       fiber: round1(it.fiber * f), sodium: round1(it.sodium * f), addedSugar: round1(it.addedSugar * f)
     })
   };
+}
+// Any nutrient still missing after the estimate stays 0 so the tracker never reads undefined.
+function zeroDefaults(list) {
+  list.forEach(function(r) { MICRO.KEYS.forEach(function(k) { if (r.per100[k] === undefined || r.per100[k] === null) r.per100[k] = 0; }); });
+  return list;
+}
+// Local items carry estimates for most nutrients; the estimator fills whatever is missing (e.g. manganese).
+async function withMicros(list, zeroIsMissing) {
+  try { await MICRO.fillPer100(list, { treatZeroAsMissing: zeroIsMissing, timeoutMs: 6500 }); } catch (e) { console.error('MICRO_FILL_FAILED', e && e.message); }
+  return zeroDefaults(list);
 }
 function localSearch(query, loc) {
   var words = norm(query).split(' ').filter(Boolean);
@@ -117,7 +128,11 @@ function localSearch(query, loc) {
   function score(x) { return words.filter(function(w) { return x.text.indexOf(w) > -1; }).length; }
   // A search that names a restaurant (every word is in its name/aliases, e.g. "katzs") lists that
   // restaurant's whole menu. Anything else is a broad dish search and gets capped and ranked.
-  var nameMatch = function(x) { return words.every(function(w) { return x.spotText.indexOf(w) > -1; }); };
+  // "el meson enchilada" also counts: some words name the restaurant, the rest name the dish.
+  var nameMatch = function(x) {
+    if (words.every(function(w) { return x.spotText.indexOf(w) > -1; })) return true;
+    return words.some(function(w) { return x.spotText.indexOf(w) > -1; }) && words.every(function(w) { return (x.spotText + x.text).indexOf(w) > -1; });
+  };
   var nameSpots = {};
   hits.forEach(function(x) { if (nameMatch(x)) nameSpots[x.it.spot] = true; });
   // Only a search that points at one or two restaurants counts as "naming" one. A word like "pizza" sits in
@@ -186,8 +201,9 @@ async function handler(req, res) {
     // just means the member sees the local items alone, so a slow FatSecret can never hold up local results.
     var fsResults = [];
     try { fsResults = await withTimeout(cachedFatsecret(query), FATSECRET_WAIT_MS); } catch (e) { console.error('FATSECRET_WITH_LOCAL_FAILED', e && e.message); }
+    var combined = await withMicros(local.concat(fsResults), false);
     res.setHeader('Cache-Control', 'public, s-maxage=600, stale-while-revalidate=3600');
-    res.status(200).json({ results: local.concat(fsResults) });
+    res.status(200).json({ results: combined });
     return;
   }
 
@@ -265,6 +281,7 @@ async function handler(req, res) {
       return {
         name: food.food_name,
         brandName: food.brand_name || '',
+        source: 'fatsecret',
         servingName: serving.serving_description || (grams + ' g'),
         servingGrams: grams,
         per100: {
@@ -291,6 +308,7 @@ async function handler(req, res) {
       return;
     }
 
+    if (!req.query.skipLocal) await withMicros(cleanResults, true);
     res.status(200).json({ results: cleanResults });
   } catch (err) {
     // getAccessToken throwing here almost always means the OAuth token request itself failed —

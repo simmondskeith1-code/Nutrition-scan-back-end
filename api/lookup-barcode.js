@@ -24,7 +24,16 @@ module.exports = async function handler(req, res) {
     return res.status(405).json({ error: 'Only POST requests allowed' });
   }
 
-  const { barcode } = req.body || {};
+  const { barcode, noEstimate } = req.body || {};
+  // Nutrients the product record does not carry are estimated and flagged in estimatedKeys.
+  // Supplement lookups pass noEstimate: a missing value there means the product has none.
+  const finish = async (r) => {
+    if (!noEstimate) {
+      try { await require('../lib/micro-estimate.js').fillFlat(r, r.name, 'barcode product'); }
+      catch (e) { console.error('Barcode estimate failed:', e && e.message); }
+    }
+    return res.status(200).json(r);
+  };
   if (!barcode) {
     return res.status(400).json({ error: 'No barcode provided' });
   }
@@ -44,17 +53,17 @@ module.exports = async function handler(req, res) {
   try {
     const edamamResult = await tryEdamam(variants);
     if (edamamResult) {
-      return res.status(200).json(edamamResult);
+      return finish(edamamResult);
     }
 
     const offResult = await tryOpenFoodFacts(variants);
     if (offResult) {
-      return res.status(200).json(offResult);
+      return finish(offResult);
     }
 
     const fdcResult = await tryFDC(variants);
     if (fdcResult) {
-      return res.status(200).json(fdcResult);
+      return finish(fdcResult);
     }
 
     return res.status(404).json({ error: 'No product found for that barcode' });

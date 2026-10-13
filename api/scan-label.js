@@ -24,7 +24,7 @@ module.exports = async function handler(req, res) {
     return res.status(405).json({ error: 'Only POST requests allowed' });
   }
 
-  const { imageBase64, mediaType } = req.body || {};
+  const { imageBase64, mediaType, noEstimate } = req.body || {};
 
   if (!imageBase64) {
     return res.status(400).json({ error: 'No image provided' });
@@ -63,10 +63,22 @@ module.exports = async function handler(req, res) {
     '  "b6": number,',
     '  "b12": number,',
     '  "zinc": number,',
-    '  "vitK": number',
+    '  "vitK": number,',
+    '  "vitA": number,',
+    '  "folate": number,',
+    '  "copper": number,',
+    '  "selenium": number,',
+    '  "manganese": number,',
+    '  "iodine": number,',
+    '  "choline": number,',
+    '  "biotin": number,',
+    '  "dha": number,',
+    '  "productName": string | null,',
+    '  "servingGrams": number | null',
     '}',
     'Units: cal in kcal, protein/carbs/fat/iron/calcium/magnesium/vitE/sodium/b6/zinc in mg or g as printed (protein/carbs/fat/sodium/potassium/calcium/magnesium/iron in their standard label units, grams for protein/carbs/fat, milligrams for sodium/calcium/potassium/magnesium/iron), vitD/b12/vitK in mcg.',
     '"addedSugar" is the "Includes Xg Added Sugars" line printed under Total Sugars on US labels, in grams. This is a distinct printed line from "Total Sugars", not the same value, and not something to calculate yourself. If the label has no such line, use null.',
+    'vitA in mcg, folate in mcg, copper in mcg (convert mg to mcg), selenium in mcg, manganese in mg, iodine in mcg, choline in mg, biotin in mcg, dha in mg. "productName" is the product name if visible, and "servingGrams" the serving weight in grams if printed (for example "2 tbsp (30g)" is 30).',
     'If a value is not printed on the label, use null for that field. Do not guess or estimate values that are not shown.',
   ].join('\n');
 
@@ -80,7 +92,7 @@ module.exports = async function handler(req, res) {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-5',
-        max_tokens: 500,
+        max_tokens: 800,
         messages: [
           {
             role: 'user',
@@ -128,26 +140,27 @@ module.exports = async function handler(req, res) {
 
     const field = (key) => (parsed[key] === undefined ? null : parsed[key]);
 
-    return res.status(200).json({
+    const result = {
       cal: field('cal'),
       protein: field('protein'),
       carbs: field('carbs'),
       fat: field('fat'),
       fiber: field('fiber'),
       addedSugar: field('addedSugar'),
-      iron: field('iron'),
-      calcium: field('calcium'),
-      vitD: field('vitD'),
-      potassium: field('potassium'),
-      magnesium: field('magnesium'),
-      vitC: field('vitC'),
-      vitE: field('vitE'),
       sodium: field('sodium'),
-      b6: field('b6'),
-      b12: field('b12'),
-      zinc: field('zinc'),
-      vitK: field('vitK'),
-    });
+      servingWeightG: field('servingGrams'),
+      name: field('productName'),
+    };
+    ['iron', 'calcium', 'vitD', 'potassium', 'magnesium', 'vitC', 'vitE', 'b6', 'b12', 'zinc', 'vitK',
+      'vitA', 'folate', 'copper', 'selenium', 'manganese', 'iodine', 'choline', 'biotin', 'dha'].forEach((k) => { result[k] = field(k); });
+
+    // Anything the label does not print is estimated from the product and its macros, and flagged
+    // in estimatedKeys so the app can say so. Printed values are never changed.
+    if (!noEstimate) {
+      try { await require('../lib/micro-estimate.js').fillFlat(result, result.name, 'nutrition label'); }
+      catch (e) { console.error('Scan-label estimate failed:', e && e.message); }
+    }
+    return res.status(200).json(result);
   } catch (err) {
     console.error('Scan-label handler error:', err);
     return res.status(500).json({ error: 'Server error processing image' });

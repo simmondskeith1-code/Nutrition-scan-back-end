@@ -168,7 +168,9 @@ function localSearch(query, loc) {
       if (order[i].items[round]) picked.push(order[i].items[round]);
     }
   }
-  return named.slice(0, 40).concat(picked).map(mapLocal);
+  var out = named.slice(0, 40).concat(picked).map(mapLocal);
+  out.isNamed = isNamed && named.length > 0;
+  return out;
 }
 
 async function handler(req, res) {
@@ -195,13 +197,17 @@ async function handler(req, res) {
   var la = parseFloat(req.query.lat), ln = parseFloat(req.query.lng);
   if (isFinite(la) && isFinite(ln) && Math.abs(la) <= 90 && Math.abs(ln) <= 180) loc = { lat: la, lng: ln };
 
+  // fast=1: answer right away without the slow AI micronutrient fill. The app asks again without it in the background.
+  var fast = req.query.fast === '1' || req.query.fast === 'true';
   var local = req.query.skipLocal ? [] : localSearch(query, loc);
   if (local.length) {
     // Local matches first. FatSecret is still asked for chain results, but a failure or a slow reply
     // just means the member sees the local items alone, so a slow FatSecret can never hold up local results.
     var fsResults = [];
-    try { fsResults = await withTimeout(cachedFatsecret(query), FATSECRET_WAIT_MS); } catch (e) { console.error('FATSECRET_WITH_LOCAL_FAILED', e && e.message); }
-    var combined = await withMicros(local.concat(fsResults), false);
+    // A search that names a local restaurant ('griffys', 'tinos pizza') skips the chain lookup entirely.
+    if (!local.isNamed) { try { fsResults = await withTimeout(cachedFatsecret(query), FATSECRET_WAIT_MS); } catch (e) { console.error('FATSECRET_WITH_LOCAL_FAILED', e && e.message); } }
+    var merged = local.concat(fsResults);
+    var combined = fast ? zeroDefaults(merged) : await withMicros(merged, false);
     res.setHeader('Cache-Control', 'public, s-maxage=600, stale-while-revalidate=3600');
     res.status(200).json({ results: combined });
     return;
@@ -308,7 +314,7 @@ async function handler(req, res) {
       return;
     }
 
-    if (!req.query.skipLocal) await withMicros(cleanResults, true);
+    if (!req.query.skipLocal) { if (fast) zeroDefaults(cleanResults); else await withMicros(cleanResults, true); }
     res.status(200).json({ results: cleanResults });
   } catch (err) {
     // getAccessToken throwing here almost always means the OAuth token request itself failed —
@@ -321,7 +327,7 @@ async function handler(req, res) {
 module.exports = handler;
 
 // Speed: repeat searches are answered from memory for 10 minutes, and a slow FatSecret reply is cut off.
-var FATSECRET_WAIT_MS = 3500;
+var FATSECRET_WAIT_MS = 2200;
 var FS_CACHE = new Map();
 function cachedFatsecret(query) {
   var key = norm(query), hit = FS_CACHE.get(key);

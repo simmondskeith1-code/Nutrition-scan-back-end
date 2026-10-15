@@ -1,15 +1,151 @@
 // Vercel serverless function: /api/lookup-barcode
-// Three-tier fallback chain: Edamam Food Database (primary, paid RapidAPI account, unchanged
-// logic) → Open Food Facts (free, no key) → USDA FoodData Central Branded Foods (free, needs
-// FDC_API_KEY env var). Each tier is tried in turn only if the one before it found nothing.
-// Also tries a couple of barcode digit variants against each source, since a scanner can hand
-// back either a 12-digit UPC-A or a 13-digit EAN-13 depending on how the physical barcode is
-// printed, and an exact-match lookup against the wrong digit count silently misses a product
-// that's actually in the database.
+// Used by the Fuel Your Fitness tracker's barcode scan. Upgraded so it agrees with Above the Label.
 //
-// Response shape is unchanged from the original Edamam-only version — the client doesn't need
-// to change at all. A "source" field ("edamam", "openfoodfacts", or "fdc") is added for your
-// own debugging; the client can ignore it.
+// What changed from the old Edamam-first chain:
+//  1. The barcode is cleaned first: digits only, UPC-E expanded, check digit verified, then looked up as
+//     12, 13 and 14 digit forms so a UPC-A / EAN-13 mismatch cannot silently miss a product.
+//  2. Tier 0 is the Above the Label database (members' own label photos). When a member-verified record
+//     exists it wins, so both scanners show the same numbers.
+//  3. FoodData Central, Edamam (exact UPC match only) and Open Food Facts are asked in parallel. When two
+//     sources agree on calories the answer is marked "confirmed"; when they disagree it is marked "disputed"
+//     and the other answers come back in "alt" so the app can ask the member instead of guessing.
+//  4. Edamam's loose "hints" list (a similar product, not an exact UPC match) is now a last resort and is
+//     marked "approximate". The old code accepted it as if it were the scanned product.
+//
+// Response keeps the old shape and adds: upc, brand, confidence (verified | confirmed | single | disputed |
+// approximate), warnings, alt. Optional env var ATL_API_URL points at the Above the Label server.
+
+const ATL_URL = process.env.ATL_API_URL || 'https://live-above-scorecard.onrender.com';
+
+function digitsOf(v) { return String(v == null ? '' : v).replace(/\D/g, ''); }
+
+// GS1 check digit for 8, 12, 13 and 14 digit codes.
+function gs1Valid(code) {
+  const c = digitsOf(code);
+  if ([8, 12, 13, 14].indexOf(c.length) === -1) return false;
+  let sum = 0;
+  const n = c.length - 1;
+  for (let i = 0; i < n; i++) sum += (+c[i]) * (((n - 1 - i) % 2 === 0) ? 3 : 1);
+  return ((10 - (sum % 10)) % 10) === +c[n];
+}
+
+// UPC-E (short code) to the full 12 digit UPC-A. Returns null if it is not a valid UPC-E.
+function expandUpcE(code) {
+  const c = digitsOf(code);
+  const e = c.length === 8 ? c : c.length === 7 ? '0' + c : null;
+  if (!e || (e[0] !== '0' && e[0] !== '1')) return null;
+  const ns = e[0], d = e.slice(1, 7), chk = e[7], last = d[5];
+  let body;
+  if ('012'.indexOf(last) !== -1) body = d[0] + d[1] + last + '0000' + d[2] + d[3] + d[4];
+  else if (last === '3') body = d[0] + d[1] + d[2] + '00000' + d[3] + d[4];
+  else if (last === '4') body = d[0] + d[1] + d[2] + d[3] + '00000' + d[4];
+  else body = d[0] + d[1] + d[2] + d[3] + d[4] + '0000' + last;
+  const upcA = ns + body + chk;
+  return gs1Valid(upcA) ? upcA : null;
+}
+
+// Returns { canon, variants } or null when the digits cannot be a real product code.
+function cleanBarcode(raw) {
+  let d = digitsOf(raw);
+  if (d.length === 8 || d.length === 7) {
+    const up = expandUpcE(d);
+    if (up) d = up;
+    else if (d.length === 8 && gs1Valid(d)) { /* a genuine EAN-8, keep it */ }
+    else return null;
+  }
+  if (!gs1Valid(d)) return null;
+  const s = d.replace(/^0+/, '');
+  if (!s) return null;
+  const variants = [];
+  [12, 13, 14].forEach(function (n) { if (s.length <= n) variants.push(s.padStart(n, '0')); });
+  if (variants.indexOf(s) === -1) variants.push(s);
+  return { canon: s.padStart(s.length <= 12 ? 12 : 13, '0'), variants: Array.from(new Set(variants)) };
+}
+
+// fetch with a hard timeout so one slow source cannot stall the scan.
+async function fetchT(url, opts, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(function () { ctrl.abort(); }, ms || 5000);
+  try { return await fetch(url, Object.assign({}, opts || {}, { signal: ctrl.signal })); }
+  finally { clearTimeout(timer); }
+}
+
+// ---------------- Above the Label database (tier 0, members' own label photos) ----------------
+async function tryAboveTheLabel(variants) {
+  for (const code of variants.slice(0, 2)) {
+    try {
+      const r = await fetchT(ATL_URL + '/api/scan/nutrition?upc=' + encodeURIComponent(code), { headers: { Accept: 'application/json' } }, 4000);
+      if (!r.ok) continue;
+      const d = await r.json();
+      if (!d || !d.found || !d.nutrition) continue;
+      const n = d.nutrition;
+      return {
+        source: 'abovethelabel',
+        verifiedByMember: !!d.memberVerified,
+        name: d.name || 'Scanned Product',
+        brand: d.brand || '',
+        servingLabel: d.servingLabel || (d.servingG ? d.servingG + 'g' : '100g'),
+        servingWeightG: d.servingG || 100,
+        cal: n.cal == null ? null : n.cal, protein: n.p == null ? null : n.p, carbs: n.c == null ? null : n.c, fat: n.f == null ? null : n.f,
+        fiber: n.fiber == null ? null : n.fiber, sodium: n.sodium == null ? null : n.sodium, addedSugar: n.addedSugar == null ? null : n.addedSugar,
+        iron: null, calcium: null, vitD: null, potassium: null, magnesium: null, vitC: null, vitE: null, vitK: null, b6: null, b12: null, zinc: null,
+      };
+    } catch (e) { /* try the next variant */ }
+  }
+  return null;
+}
+
+// ---------------- Choosing between sources ----------------
+const PRIORITY = { abovethelabel: 0, fdc: 1, edamam: 2, openfoodfacts: 3 };
+
+function calPer100(r) {
+  if (!r || r.cal == null) return null;
+  const g = r.servingWeightG || 100;
+  return g > 0 ? (r.cal * 100) / g : null;
+}
+function close(a, b) {
+  if (a == null || b == null) return false;
+  if (a < 20 && b < 20) return true;
+  return Math.abs(a - b) <= 0.25 * Math.max(a, b);
+}
+// Atwater check: protein and carbs 4 kcal/g, fat 9 kcal/g. Flags numbers that cannot be one real label.
+function warningsFor(r) {
+  const w = [];
+  if (r.cal == null) { w.push('no_calories'); return w; }
+  const est = (r.protein || 0) * 4 + (r.carbs || 0) * 4 + (r.fat || 0) * 9;
+  if (r.cal > 40 && Math.abs(est - r.cal) > 0.6 * Math.max(est, r.cal)) w.push('macros_do_not_match_calories');
+  const per100 = calPer100(r);
+  if (per100 != null && per100 > 900) w.push('calories_per_100g_too_high');
+  return w;
+}
+function choose(cands) {
+  const list = cands.filter(Boolean).sort(function (a, b) { return PRIORITY[a.source] - PRIORITY[b.source]; });
+  if (!list.length) return null;
+  const member = list.find(function (r) { return r.source === 'abovethelabel' && r.verifiedByMember; });
+  if (member) return finish2(member, 'verified', list);
+  const pool = list.filter(function (r) { return !(r.source === 'abovethelabel' && !r.verifiedByMember); });
+  if (!pool.length) return null;
+  if (pool.length === 1) return finish2(pool[0], 'single', pool);
+  // Find the highest-priority source that at least one other source agrees with.
+  for (let i = 0; i < pool.length; i++) {
+    for (let j = 0; j < pool.length; j++) {
+      if (i !== j && close(calPer100(pool[i]), calPer100(pool[j]))) return finish2(pool[i], 'confirmed', pool);
+    }
+  }
+  return finish2(pool[0], 'disputed', pool);
+}
+function finish2(pick, confidence, all) {
+  const out = Object.assign({}, pick);
+  delete out.verifiedByMember;
+  out.confidence = confidence;
+  out.warnings = warningsFor(pick);
+  if (confidence === 'disputed') {
+    out.alt = all.filter(function (r) { return r !== pick; }).map(function (r) {
+      return { source: r.source, name: r.name, brand: r.brand || '', servingLabel: r.servingLabel, cal: r.cal };
+    });
+  }
+  return out;
+}
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*'); // tighten to your domain before real launch
@@ -38,35 +174,34 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: 'No barcode provided' });
   }
 
-  // Barcode variants to try, in order: as scanned, with one leading zero stripped (in case the
-  // scanner read a 13-digit EAN-13 but the database has it indexed as 12-digit UPC-A), and with
-  // one leading zero added (the reverse case). Duplicates are removed since a barcode with no
-  // leading zero to strip, or already at typical max length, would otherwise produce the same
-  // string twice.
-  const raw = String(barcode).trim();
-  const variants = Array.from(new Set([
-    raw,
-    raw.replace(/^0+/, '') || raw, // stripped (guard against emptying the string entirely)
-    '0' + raw,
-  ]));
+  const cleaned = cleanBarcode(barcode);
+  if (!cleaned) {
+    // A misread (check digit fails) would look up the wrong product, so it is refused instead.
+    return res.status(422).json({ error: 'Barcode did not read correctly', code: 'bad_barcode' });
+  }
+  const variants = cleaned.variants;
 
   try {
-    const edamamResult = await tryEdamam(variants);
-    if (edamamResult) {
-      return finish(edamamResult);
+    // Ask everything at once. Each tier swallows its own errors and returns null.
+    const settled = await Promise.all([
+      tryAboveTheLabel(variants).catch(function () { return null; }),
+      tryFDC(variants).catch(function () { return null; }),
+      tryEdamam(variants, false).catch(function () { return null; }),
+      tryOpenFoodFacts(variants).catch(function () { return null; }),
+    ]);
+    let result = choose(settled);
+    if (!result) {
+      // Last resort: Edamam's closest-match list. It may be a similar product, so it is labelled approximate.
+      const loose = await tryEdamam(variants, true).catch(function () { return null; });
+      if (loose) {
+        result = Object.assign({}, loose, { confidence: 'approximate', warnings: warningsFor(loose) });
+      }
     }
-
-    const offResult = await tryOpenFoodFacts(variants);
-    if (offResult) {
-      return finish(offResult);
+    if (!result) {
+      return res.status(404).json({ error: 'No product found for that barcode' });
     }
-
-    const fdcResult = await tryFDC(variants);
-    if (fdcResult) {
-      return finish(fdcResult);
-    }
-
-    return res.status(404).json({ error: 'No product found for that barcode' });
+    result.upc = cleaned.canon;
+    return finish(result);
   } catch (err) {
     console.error('Barcode lookup handler error:', err);
     return res.status(500).json({ error: 'Server error looking up barcode' });
@@ -75,7 +210,7 @@ module.exports = async function handler(req, res) {
 
 // ---------------- Edamam (primary, unchanged logic, now tried across barcode variants) ----------------
 
-async function tryEdamam(variants) {
+async function tryEdamam(variants, allowHints) {
   const rapidApiKey = process.env.RAPIDAPI_KEY;
   if (!rapidApiKey) {
     console.error('Edamam skipped: missing RAPIDAPI_KEY env var');
@@ -83,16 +218,16 @@ async function tryEdamam(variants) {
   }
   const RAPIDAPI_HOST = 'edamam-food-and-grocery-database.p.rapidapi.com';
 
-  for (const code of variants) {
+  for (const code of variants.slice(0, 2)) {
     try {
       const url = `https://${RAPIDAPI_HOST}/api/food-database/v2/parser?upc=${encodeURIComponent(code)}`;
-      const response = await fetch(url, {
+      const response = await fetchT(url, {
         method: 'GET',
         headers: {
           'X-RapidAPI-Key': rapidApiKey,
           'X-RapidAPI-Host': RAPIDAPI_HOST,
         },
-      });
+      }, 4000);
 
       if (!response.ok) {
         const errText = await response.text();
@@ -111,7 +246,7 @@ async function tryEdamam(variants) {
         food = p.food;
         servingWeightG = (p.measure && p.measure.weight) || 100;
         servingLabel = (p.measure && p.measure.label) || '100g';
-      } else if (data.hints && data.hints[0]) {
+      } else if (allowHints && data.hints && data.hints[0]) {
         const h = data.hints[0];
         food = h.food;
         const measures = h.measures || [];
@@ -133,6 +268,7 @@ async function tryEdamam(variants) {
       return {
         source: 'edamam',
         name: food.label || 'Scanned Product',
+        brand: food.brand || '',
         servingLabel: servingLabel,
         servingWeightG: Math.round(servingWeightG),
         cal: scale(nutrients.ENERC_KCAL),
@@ -150,13 +286,13 @@ async function tryEdamam(variants) {
         sodium: scale(nutrients.NA),
         vitK: scale(nutrients.VITK1),
         // This tier of the Edamam database does not reliably return B6/B12/zinc on
-        // branded products — left null; the person can add them manually if the
+        // branded products , left null; the person can add them manually if the
         // physical label shows them.
         b6: null,
         b12: null,
         zinc: null,
         // "Added Sugars" is its own line on US Nutrition Facts labels, distinct from total
-        // sugar — Edamam exposes it under this separate nutrient key when the brand submitted
+        // sugar , Edamam exposes it under this separate nutrient key when the brand submitted
         // it, so it gets its own scale() call rather than being folded into SUGAR.
         addedSugar: scale(nutrients['SUGAR.added']),
       };
@@ -172,12 +308,12 @@ async function tryEdamam(variants) {
 // ---------------- Open Food Facts (fallback, free, no API key) ----------------
 
 async function tryOpenFoodFacts(variants) {
-  for (const code of variants) {
+  for (const code of variants.slice(0, 2)) {
     try {
       const url = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(code)}.json`;
-      const response = await fetch(url, {
+      const response = await fetchT(url, {
         headers: { 'User-Agent': 'FuelYourFitnessTracker/1.0 (barcode fallback lookup)' },
-      });
+      }, 4000);
       if (!response.ok) continue;
 
       const data = await response.json();
@@ -187,7 +323,7 @@ async function tryOpenFoodFacts(variants) {
       const n = product.nutriments || {};
 
       // OFF's nutriments are per-100g, but the client displays these numbers as being FOR the
-      // reported servingWeightG (e.g. "values shown are per 1 bag (28g)") — so they have to be
+      // reported servingWeightG (e.g. "values shown are per 1 bag (28g)") , so they have to be
       // scaled to the label's actual serving here, the same way the Edamam branch above does.
       // Without this scaling, a 28g bag would show its per-100g calories mislabeled as its
       // per-28g calories, roughly 3.5x too high.
@@ -197,7 +333,7 @@ async function tryOpenFoodFacts(variants) {
 
       const num = (v) => (v === undefined || v === null || v === '' ? null : Math.round(parseFloat(v) * factor * 10) / 10);
 
-      // OFF stores sodium in grams per 100g (not mg like everything else here) — converted to
+      // OFF stores sodium in grams per 100g (not mg like everything else here) , converted to
       // mg first, then scaled to the serving like every other field.
       const sodiumMg = n.sodium_100g !== undefined && n.sodium_100g !== null
         ? Math.round(parseFloat(n.sodium_100g) * 1000 * factor * 10) / 10
@@ -206,6 +342,7 @@ async function tryOpenFoodFacts(variants) {
       return {
         source: 'openfoodfacts',
         name: product.product_name || product.generic_name || 'Scanned Product',
+        brand: String(product.brands || '').split(',')[0].trim(),
         servingLabel: servingLabel,
         servingWeightG: servingWeightG,
         // Scaled from OFF's per-100g basis to the product's actual labeled serving weight.
@@ -224,12 +361,12 @@ async function tryOpenFoodFacts(variants) {
         sodium: sodiumMg,
         vitK: num(n['vitamin-k_100g']),
         // OFF does carry these for some products (unlike this Edamam tier), but coverage is
-        // inconsistent product-to-product — honest null when the field's genuinely absent
+        // inconsistent product-to-product , honest null when the field's genuinely absent
         // rather than guessing.
         b6: num(n['vitamin-b6_100g']),
         b12: num(n['vitamin-b12_100g']),
         zinc: num(n.zinc_100g),
-        // Sparse but present on some products — OFF's separate "added sugars" field (distinct
+        // Sparse but present on some products , OFF's separate "added sugars" field (distinct
         // from total sugars_100g), scaled to serving like everything else here.
         addedSugar: num(n['added-sugars_100g']),
       };
@@ -245,7 +382,7 @@ async function tryOpenFoodFacts(variants) {
 // ---------------- USDA FoodData Central Branded Foods (third fallback, free, needs a key) ----------------
 
 // USDA nutrient numbers are stable, standardized IDs (not name strings, which vary in phrasing
-// across records) — mapping by number is the reliable way to pull the right value regardless of
+// across records) , mapping by number is the reliable way to pull the right value regardless of
 // how a given entry's foodNutrients array is ordered or worded.
 var FDC_NUTRIENT_NUMBERS = {
   cal: '208',       // Energy (kcal)
@@ -265,7 +402,7 @@ var FDC_NUTRIENT_NUMBERS = {
   b6: '415',        // Vitamin B-6 (mg)
   b12: '418',       // Vitamin B-12 (mcg)
   zinc: '309',      // Zinc, Zn (mg)
-  addedSugar: '539', // Sugars, added (g) — distinct from total sugars (269)
+  addedSugar: '539', // Sugars, added (g) , distinct from total sugars (269)
 };
 
 async function tryFDC(variants) {
@@ -275,15 +412,15 @@ async function tryFDC(variants) {
     return null;
   }
 
-  for (const code of variants) {
+  for (const code of variants.slice(0, 2)) {
     try {
-      // FoodData Central has no dedicated "look up by UPC" endpoint — the standard approach is
+      // FoodData Central has no dedicated "look up by UPC" endpoint , the standard approach is
       // searching with the barcode digits as the query text, scoped to dataType=Branded, then
       // confirming an exact match on the record's own gtinUpc field below. A non-exact search
       // hit is discarded rather than guessed at, so a wrong product never gets logged silently.
       const url = `https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${encodeURIComponent(apiKey)}`
         + `&query=${encodeURIComponent(code)}&dataType=Branded&pageSize=25`;
-      const response = await fetch(url);
+      const response = await fetchT(url, {}, 4000);
       if (!response.ok) {
         const errText = await response.text();
         console.error('FDC error for', code, ':', errText);
@@ -301,7 +438,7 @@ async function tryFDC(variants) {
       });
 
       // Branded Foods nutrient values are reported per 100g regardless of the product's actual
-      // serving size — same normalized basis as Open Food Facts — but the client displays these
+      // serving size , same normalized basis as Open Food Facts , but the client displays these
       // numbers as being FOR the reported servingWeightG, so they get scaled to the label's real
       // serving here too, same as the OFF branch above.
       const servingWeightG = food.servingSizeUnit === 'g' && food.servingSize
@@ -319,6 +456,7 @@ async function tryFDC(variants) {
       return {
         source: 'fdc',
         name: food.description || food.brandName || 'Scanned Product',
+        brand: food.brandName || food.brandOwner || '',
         servingLabel: servingLabel,
         servingWeightG: servingWeightG,
         cal: num('cal'),

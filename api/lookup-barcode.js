@@ -141,11 +141,15 @@ const SUPP_KEYS = ['vitA', 'iron', 'calcium', 'vitD', 'potassium', 'magnesium', 
 function microCount(r) { return SUPP_KEYS.filter(function (k) { return r[k] !== null && r[k] !== undefined; }).length; }
 function chooseSupplement(cands) {
   const pool = cands.filter(Boolean).filter(function (r) { return !(r.source === 'abovethelabel' && !r.verifiedByMember); })
-    .sort(function (a, b) { return (microCount(b) - microCount(a)) || (PRIORITY[a.source] - PRIORITY[b.source]); });
+    .sort(function (a, b) {
+      // NIH label data is the panel as printed, so it leads whenever it has numbers; otherwise most numbers wins.
+      const da = a.source === 'dsld' && microCount(a) > 0 ? 0 : 1, db = b.source === 'dsld' && microCount(b) > 0 ? 0 : 1;
+      return (da - db) || (microCount(b) - microCount(a)) || ((PRIORITY[a.source] || 0) - (PRIORITY[b.source] || 0));
+    });
   if (!pool.length) return null;
   const out = Object.assign({}, pool[0]);
   delete out.verifiedByMember;
-  out.confidence = out.source === 'abovethelabel' ? 'verified' : 'single';
+  out.confidence = out.source === 'abovethelabel' ? 'verified' : (out.source === 'dsld' ? 'label' : 'single');
   out.microCount = microCount(out);
   out.warnings = [];
   return out;
@@ -204,6 +208,8 @@ module.exports = async function handler(req, res) {
       tryFDC(variants).catch(function () { return null; }),
       tryEdamam(variants, false).catch(function () { return null; }),
       tryOpenFoodFacts(variants).catch(function () { return null; }),
+      // Supplements only: the NIH label database holds the Supplement Facts panel itself.
+      kind === 'supplement' ? require('../lib/dsld.js').lookupByUpc(variants).catch(function () { return null; }) : null,
     ]);
     let result = kind === 'supplement' ? chooseSupplement(settled) : choose(settled);
     if (!result) {

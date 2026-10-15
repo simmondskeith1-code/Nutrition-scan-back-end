@@ -134,6 +134,22 @@ function choose(cands) {
   }
   return finish2(pool[0], 'disputed', pool);
 }
+// Supplements: calories mean nothing here (most are zero), so sources are not compared on calories.
+// The record that carries the most vitamin and mineral numbers wins; a tie goes to the higher priority source.
+const SUPP_KEYS = ['vitA', 'iron', 'calcium', 'vitD', 'potassium', 'magnesium', 'vitC', 'vitE', 'sodium', 'b6', 'b12', 'zinc', 'vitK',
+  'folate', 'copper', 'selenium', 'manganese', 'iodine', 'choline', 'biotin', 'dha'];
+function microCount(r) { return SUPP_KEYS.filter(function (k) { return r[k] !== null && r[k] !== undefined; }).length; }
+function chooseSupplement(cands) {
+  const pool = cands.filter(Boolean).filter(function (r) { return !(r.source === 'abovethelabel' && !r.verifiedByMember); })
+    .sort(function (a, b) { return (microCount(b) - microCount(a)) || (PRIORITY[a.source] - PRIORITY[b.source]); });
+  if (!pool.length) return null;
+  const out = Object.assign({}, pool[0]);
+  delete out.verifiedByMember;
+  out.confidence = out.source === 'abovethelabel' ? 'verified' : 'single';
+  out.microCount = microCount(out);
+  out.warnings = [];
+  return out;
+}
 function finish2(pick, confidence, all) {
   const out = Object.assign({}, pick);
   delete out.verifiedByMember;
@@ -160,7 +176,7 @@ module.exports = async function handler(req, res) {
     return res.status(405).json({ error: 'Only POST requests allowed' });
   }
 
-  const { barcode, noEstimate } = req.body || {};
+  const { barcode, noEstimate, kind } = req.body || {};
   // Nutrients the product record does not carry are estimated and flagged in estimatedKeys.
   // Supplement lookups pass noEstimate: a missing value there means the product has none.
   const finish = async (r) => {
@@ -189,7 +205,7 @@ module.exports = async function handler(req, res) {
       tryEdamam(variants, false).catch(function () { return null; }),
       tryOpenFoodFacts(variants).catch(function () { return null; }),
     ]);
-    let result = choose(settled);
+    let result = kind === 'supplement' ? chooseSupplement(settled) : choose(settled);
     if (!result) {
       // Last resort: Edamam's closest-match list. It may be a similar product, so it is labelled approximate.
       const loose = await tryEdamam(variants, true).catch(function () { return null; });

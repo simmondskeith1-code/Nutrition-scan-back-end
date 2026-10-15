@@ -5,7 +5,14 @@
 // front end computes them from its database so numbers stay consistent with everything else
 // the user logs.
 //
-// Accuracy notes (v2):
+// Accuracy notes (v4):
+// - v4: each solid item also returns a volume and density, and the server blends that weight with the
+//   direct gram guess (two independent estimates), widening the range when they disagree.
+// - v4: `prior` lets a re-read after the member answers questions or picks a plate size keep the same
+//   portions unless the new information changes them, so numbers stop drifting between reads.
+// - v4: the model reports photo quality; a blurry, dark or too-far photo returns `retake` so the app asks for a reshoot.
+// - v4: if the configured model name is rejected, one retry uses the previous model.
+// (v2 notes)
 // - Accepts `images` (up to 3 angles) or the original single `imageBase64`.
 // - Accepts `hint`, a short note from the member ("grilled in olive oil, no dressing").
 // - The model is told HOW to estimate: reference objects, plate sizes, depth, density, and
@@ -21,8 +28,18 @@ module.exports.config = {
   },
 };
 
-const MODEL = process.env.PHOTO_MODEL || 'claude-sonnet-5';
+const MODEL = process.env.PHOTO_MODEL || 'claude-sonnet-5-5';
+const FALLBACK_MODEL = process.env.PHOTO_MODEL_FALLBACK || 'claude-sonnet-5';
 const SUPPORTED = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+
+const RETAKE_TEXT = {
+  blurry: 'This photo is blurry, so portions are rough. Hold steady and retake it.',
+  dark: 'This photo is too dark to size the food. Move near a window or use the torch, then retake it.',
+  too_far: 'The food is too small in the frame. Move closer so the plate fills most of the shot, then retake it.',
+  glare: 'Glare is hiding the food. Tilt the phone away from the light and retake it.',
+  angle: 'The angle hides the portions. Shoot from above, or at a 45 degree angle, and retake it.',
+  covered: 'Part of the food is hidden. Move what is covering it or add a second angle.',
+};
 
 // Plausible ceiling for one item in a single meal, in grams. Anything above is clamped.
 const MAX_ITEM_G = 1200;
@@ -35,6 +52,7 @@ const PROMPT = [
   '2. Estimate area covered and HEIGHT of each food. Piled food is usually thicker than it looks. Judge volume, then convert with typical densities: cooked rice about 0.65 g/ml, cooked pasta about 0.55 g/ml, leafy salad about 0.1 g/ml, cooked ground meat about 0.9 g/ml, cooked vegetables about 0.5 g/ml, mashed potato about 1.0 g/ml, yogurt or sauces about 1.0 g/ml.',
   '3. Sanity check with common portions: a cooked chicken breast is 120 to 200 g, a palm-sized steak about 140 g, a fist of cooked rice about 150 g, a slice of bread 30 to 40 g, one egg about 50 g, a medium banana about 120 g edible, a tablespoon of oil 14 g.',
   '4. If several photos are given they show the same meal from different angles. Use them together and do not double count.',
+  '5. For every SOLID or semi-solid food, ALSO estimate its volume in ml from what you can see (area covered times height, using the size reference) and pick the density in g/ml from the list above. Do this independently of your gram guess. Skip volume for liquids, oils, sauces under 30 g and anything you cannot see.',
   '',
   'NAMING RULES:',
   '- Use specific names a nutrition database would have, including the cooking method and the cut or fat level when you can tell, e.g. "chicken breast grilled", "ground beef 85% lean cooked", "white rice cooked", "broccoli steamed", "salmon baked", "fried egg", "olive oil".',
@@ -48,8 +66,9 @@ const PROMPT = [
   '  "isFood": boolean,',
   '  "mealName": string,',
   '  "foods": [',
-  '    { "name": string, "grams": number, "gramsLow": number, "gramsHigh": number, "confidence": "high" | "medium" | "low", "basis": string }',
+  '    { "name": string, "grams": number, "gramsLow": number, "gramsHigh": number, "confidence": "high" | "medium" | "low", "basis": string, "volumeMl": number | null, "densityGml": number | null }',
   '  ],',
+  '  "quality": { "usable": boolean, "issue": "blurry" | "dark" | "too_far" | "glare" | "angle" | "covered" | null },',
   '  "note": string | null,',
   '  "questions": [ { "q": string, "options": [string, string] } ]',
   '}',
@@ -61,6 +80,7 @@ const PROMPT = [
   '- If the photo is not food, set isFood to false and foods to an empty array.',
   '- "note" is one short sentence only if something affects accuracy (hidden food, mixed dish, unclear scale, dark photo); otherwise null.',
   '- Maximum 14 items, largest portions first.',
+  '- "quality.usable" is false only when the photo is too poor to size the food (heavy blur, very dark, food tiny in frame, glare hiding the food, food mostly hidden). Then still give your best guess, with low confidence and wide ranges, and set "issue". When usable, issue is null.',
   '- "questions": up to 3 short follow-up questions for the member, ONLY about things you cannot see that would move calories or macros by more than about 10 percent: cooking method or oil/butter used, sauces and dressings, cheese amount, sugar or milk in a drink, what is inside a wrap or casserole, or a portion hidden under other food. Each has 2 to 4 short concrete answer options (for example "Pan fried in oil", "Grilled, no oil"). Never ask what the photo or the member note already answers. Use an empty array if nothing material is unclear.',
 ].join('\n');
 
@@ -73,6 +93,25 @@ function extractJson(text) {
     try { return JSON.parse(cleaned.slice(a, b + 1)); } catch (e) { /* fall through */ }
   }
   return null;
+}
+
+// Two independent estimates of the same food: the direct gram guess and volume times density.
+// Close agreement tightens the number; a wide gap means the model is unsure, so the range widens and
+// confidence drops. Densities outside a plausible band are ignored.
+function reconcile(g, lo, hi, vol, dens, confidence) {
+  if (!(vol > 0 && vol <= 2500 && dens >= 0.08 && dens <= 1.6)) return { g, lo, hi, confidence };
+  const vg = vol * dens;
+  const ratio = Math.max(g, vg) / Math.min(g, vg);
+  if (ratio <= 1.25) {
+    const m = Math.round((g + vg) / 2);
+    return { g: Math.min(MAX_ITEM_G, m), lo: Math.max(1, Math.round(Math.min(lo, m, vg * 0.9))), hi: Math.round(Math.max(hi, m)), confidence };
+  }
+  if (ratio <= 1.7) {
+    const m = Math.round(Math.sqrt(g * vg));
+    return { g: Math.min(MAX_ITEM_G, m), lo: Math.max(1, Math.round(Math.min(lo, g, vg) * 0.95)), hi: Math.round(Math.max(hi, g, vg) * 1.05), confidence: confidence === 'high' ? 'medium' : confidence };
+  }
+  const m = Math.round(Math.sqrt(g * vg));
+  return { g: Math.min(MAX_ITEM_G, m), lo: Math.max(1, Math.round(Math.min(g, vg) * 0.9)), hi: Math.round(Math.max(g, vg) * 1.1), confidence: 'low' };
 }
 
 function num(v) {
@@ -108,6 +147,15 @@ module.exports = async function handler(req, res) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: 'Server misconfigured: missing API key' });
 
+  // Previous read of this same photo set (the member answered questions, picked a plate size or added a note).
+  const prior = (Array.isArray(body.prior) ? body.prior : []).slice(0, 14)
+    .map((f) => ({ name: String(f && f.name || '').replace(/\s+/g, ' ').trim().slice(0, 80), grams: Math.round(num(f && f.grams)) }))
+    .filter((f) => f.name && f.grams > 0 && f.grams <= MAX_ITEM_G);
+  const priorText = prior.length
+    ? '\n\nPrevious estimate of this SAME meal, which the member has already seen: ' + prior.map((f) => f.name + ' ' + f.grams + ' g').join('; ') +
+      '. Keep each portion and name unless the member note or answers below, or a plate size they gave, clearly change it. Do not change a number just to be different. Update only what the new information affects, and add or remove foods only if the new information says so.'
+    : '';
+
   const content = [];
   list.forEach((im, i) => {
     if (list.length > 1) content.push({ type: 'text', text: 'Photo ' + (i + 1) + ' of ' + list.length + ':' });
@@ -115,23 +163,18 @@ module.exports = async function handler(req, res) {
   });
   content.push({
     type: 'text',
-    text: PROMPT + (hint ? '\n\nMember note (trust this): ' + hint : ''),
+    text: PROMPT + priorText + (hint ? '\n\nMember note (trust this): ' + hint : ''),
   });
 
+  let activeModel = MODEL;
   async function callModel() {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 1400,
-        messages: [{ role: 'user', content }],
-      }),
-    });
+    let response = await postModel(activeModel);
+    // A rejected or unknown model name should not take the feature down: fall back once, and stay there.
+    if (!response.ok && (response.status === 400 || response.status === 404) && activeModel !== FALLBACK_MODEL) {
+      console.error('Photo model rejected, falling back:', activeModel, response.status, await response.text());
+      activeModel = FALLBACK_MODEL;
+      response = await postModel(activeModel);
+    }
     if (!response.ok) {
       console.error('Anthropic API error:', response.status, await response.text());
       return null;
@@ -139,6 +182,22 @@ module.exports = async function handler(req, res) {
     const data = await response.json();
     const textBlock = (data.content || []).find((b) => b.type === 'text');
     return textBlock ? extractJson(textBlock.text) : null;
+  }
+
+  function postModel(model) {
+    return fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 1800,
+        messages: [{ role: 'user', content }],
+      }),
+    });
   }
 
   // Phase 2 (only for foods the tracker's list could not match): nutrition for the portion in THIS photo,
@@ -162,7 +221,7 @@ module.exports = async function handler(req, res) {
       const r = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model: MODEL, max_tokens: 400 + asked.length * 420, messages: [{ role: 'user', content: ecContent }] }),
+        body: JSON.stringify({ model: activeModel, max_tokens: 400 + asked.length * 420, messages: [{ role: 'user', content: ecContent }] }),
       });
       if (!r.ok) { console.error('Photo estimate HTTP', r.status); return res.status(502).json({ error: 'Estimate unavailable' }); }
       const d = await r.json();
@@ -203,12 +262,15 @@ module.exports = async function handler(req, res) {
       hi = Math.min(MAX_ITEM_G * 1.2, Math.round(Math.max(hi, g)));
       const name = String(f.name).trim().slice(0, 80);
       const key = name.toLowerCase();
+      let confidence = ['high', 'medium', 'low'].includes(f.confidence) ? f.confidence : 'medium';
+      const rec = reconcile(g, lo, hi, num(f.volumeMl), num(f.densityGml), confidence);
+      g = rec.g; lo = rec.lo; hi = rec.hi; confidence = rec.confidence;
       const item = {
         name,
         grams: g,
         gramsLow: lo,
         gramsHigh: hi,
-        confidence: ['high', 'medium', 'low'].includes(f.confidence) ? f.confidence : 'medium',
+        confidence,
         basis: typeof f.basis === 'string' ? f.basis.slice(0, 80) : '',
       };
       // Merge exact duplicate names instead of listing the same food twice.
@@ -231,13 +293,19 @@ module.exports = async function handler(req, res) {
     const totalG = foods.reduce((s, f) => s + f.grams, 0);
     if (totalG > 2500) note = (note ? note + ' ' : '') + 'That is a very large total. Check the grams.';
 
+    const q = parsed.quality && typeof parsed.quality === 'object' ? parsed.quality : {};
+    const issue = ['blurry', 'dark', 'too_far', 'glare', 'angle', 'covered'].includes(q.issue) ? q.issue : null;
+    const retake = q.usable === false && issue ? RETAKE_TEXT[issue] : null;
+
     return res.status(200).json({
       isFood: parsed.isFood !== false && foods.length > 0,
+      retake,
+      retakeIssue: retake ? issue : null,
       mealName: typeof parsed.mealName === 'string' ? parsed.mealName.slice(0, 60) : '',
       foods,
       note,
       questions,
-      version: 3,
+      version: 4,
     });
   } catch (err) {
     console.error('analyze-food-photo error:', err);

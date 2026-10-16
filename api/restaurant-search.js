@@ -67,10 +67,16 @@ function addonsFor(it) {
   var list = ADDONS_BY_SPOT[it.spot] || [];
   var isSlice = /slice/.test(it.servingName);
   return list.filter(function(a) {
+    // "only" limits a swap or removal to the dishes that really contain that ingredient.
+    if (a.only && a.only.indexOf(it.name) < 0) return false;
     if (a.servingName === '1 portion') return !isSlice;
     return a.servingName === 'on ' + it.servingName;
   }).map(function(a) {
-    return Object.assign({ name: a.name.replace('Add-on: ', ''), cal: a.cal, p: a.p, c: a.c, f: a.f, fiber: a.fiber, sodium: a.sodium, addedSugar: a.addedSugar }, a.m || {});
+    var out = Object.assign({ name: a.name.replace('Add-on: ', ''), cal: a.cal, p: a.p, c: a.c, f: a.f, fiber: a.fiber, sodium: a.sodium, addedSugar: a.addedSugar }, a.m || {});
+    // kind: 'swap' or 'remove' entries carry negative or net values; group: choices in one group are either/or.
+    if (a.kind) out.kind = a.kind;
+    if (a.group) out.group = a.group;
+    return out;
   });
 }
 // Approximate area centers (data/spot-regions.json). Used to order and trim local results by how far the

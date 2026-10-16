@@ -139,6 +139,29 @@ function choose(cands) {
 const SUPP_KEYS = ['vitA', 'iron', 'calcium', 'vitD', 'potassium', 'magnesium', 'vitC', 'vitE', 'sodium', 'b6', 'b12', 'zinc', 'vitK',
   'folate', 'copper', 'selenium', 'manganese', 'iodine', 'choline', 'biotin', 'dha'];
 function microCount(r) { return SUPP_KEYS.filter(function (k) { return r[k] !== null && r[k] !== undefined; }).length; }
+
+function nameTokens(t) {
+  return String(t || '').toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').split(/\s+/).filter(function (w) { return w.length > 1; });
+}
+async function nameFallback(r) {
+  const brand = String(r.brand || '').trim();
+  const q = ((brand && r.name.toLowerCase().indexOf(brand.toLowerCase()) === 0 ? '' : brand + ' ') + r.name).replace(/\s+/g, ' ').trim();
+  const labels = await require('../lib/dsld.js').searchByName(q, 5);
+  const want = nameTokens(r.name), bw = nameTokens(brand);
+  let best = null, bestScore = 0;
+  (labels || []).forEach(function (l) {
+    const have = nameTokens(l.name);
+    const lb = nameTokens(l.brand || '');
+    if (bw.length && !bw.some(function (w) { return lb.indexOf(w) >= 0 || have.indexOf(w) >= 0; })) return;
+    const hit = want.filter(function (w) { return have.indexOf(w) >= 0; }).length;
+    const score = want.length ? hit / want.length : 0;
+    if (score >= 0.5 && score > bestScore) { best = l; bestScore = score; }
+  });
+  if (!best) return null;
+  const out = Object.assign({}, best, { source: 'dsld', confidence: 'approximate', upc: r.upc || null, warnings: ['Matched by product name, not barcode. Check it against your bottle.'] });
+  out.microCount = microCount(out);
+  return out;
+}
 function chooseSupplement(cands) {
   const pool = cands.filter(Boolean).filter(function (r) { return !(r.source === 'abovethelabel' && !r.verifiedByMember); })
     .sort(function (a, b) {
@@ -218,6 +241,13 @@ module.exports = async function handler(req, res) {
       if (loose) {
         result = Object.assign({}, loose, { confidence: 'approximate', warnings: warningsFor(loose) });
       }
+    }
+    if (kind === 'supplement' && result && result.name && microCount(result) === 0) {
+      // The barcode named the product but carried no Supplement Facts. Look the product up by name in the NIH label database.
+      try {
+        const alt = await nameFallback(result);
+        if (alt) result = alt;
+      } catch (e) { console.error('DSLD name fallback failed:', e && e.message); }
     }
     if (!result) {
       return res.status(404).json({ error: 'No product found for that barcode' });

@@ -1,0 +1,5 @@
+{
+  "functions": {
+    "api/estimate-spoken-meal.js": { "maxDuration": 60 }
+  }
+}

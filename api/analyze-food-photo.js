@@ -5,7 +5,9 @@
 // front end computes them from its database so numbers stay consistent with everything else
 // the user logs.
 //
-// Accuracy notes (v4):
+// Accuracy notes (v5): a fresh photo is read twice in parallel and the two readings are averaged; foods only one
+//   reading saw come back as low confidence; big disagreements widen the range. Re-reads with a prior stay single.
+// (v4 notes)
 // - v4: each solid item also returns a volume and density, and the server blends that weight with the
 //   direct gram guess (two independent estimates), widening the range when they disagree.
 // - v4: `prior` lets a re-read after the member answers questions or picks a plate size keep the same
@@ -112,6 +114,95 @@ function reconcile(g, lo, hi, vol, dens, confidence) {
   }
   const m = Math.round(Math.sqrt(g * vg));
   return { g: Math.min(MAX_ITEM_G, m), lo: Math.max(1, Math.round(Math.min(g, vg) * 0.9)), hi: Math.round(Math.max(g, vg) * 1.1), confidence: 'low' };
+}
+
+// Turn one raw model reading into a clean, de-duplicated food list (volume x density blended in).
+function cleanFoods(parsed) {
+  const seen = new Map();
+  (Array.isArray(parsed.foods) ? parsed.foods : []).forEach((f) => {
+    if (!f || typeof f.name !== 'string') return;
+    let g = num(f.grams);
+    if (!(g > 0)) return;
+    g = Math.min(MAX_ITEM_G, Math.round(g));
+    let lo = num(f.gramsLow);
+    let hi = num(f.gramsHigh);
+    if (!(lo > 0 && lo <= g)) lo = Math.max(1, Math.round(g * 0.75));
+    if (!(hi >= g)) hi = Math.round(g * 1.3);
+    lo = Math.round(Math.min(lo, g));
+    hi = Math.min(MAX_ITEM_G * 1.2, Math.round(Math.max(hi, g)));
+    const name = String(f.name).trim().slice(0, 80);
+    const key = name.toLowerCase();
+    let confidence = ['high', 'medium', 'low'].includes(f.confidence) ? f.confidence : 'medium';
+    const rec = reconcile(g, lo, hi, num(f.volumeMl), num(f.densityGml), confidence);
+    g = rec.g; lo = rec.lo; hi = rec.hi; confidence = rec.confidence;
+    const item = {
+      name,
+      grams: g,
+      gramsLow: lo,
+      gramsHigh: hi,
+      confidence,
+      basis: typeof f.basis === 'string' ? f.basis.slice(0, 80) : '',
+    };
+    // Merge exact duplicate names instead of listing the same food twice.
+    if (seen.has(key)) {
+      const prev = seen.get(key);
+      prev.grams = Math.min(MAX_ITEM_G, prev.grams + item.grams);
+      prev.gramsLow += item.gramsLow;
+      prev.gramsHigh += item.gramsHigh;
+    } else {
+      seen.set(key, item);
+    }
+  });
+
+  return Array.from(seen.values());
+}
+
+const STOP = new Set(['and', 'with', 'the', 'of', 'a', 'cooked', 'raw', 'fresh', 'baked', 'grilled', 'fried', 'steamed', 'roasted', 'boiled', 'sauteed', 'lean', 'plain']);
+function toks(name) {
+  const t = String(name).toLowerCase().replace(/[^a-z ]/g, ' ').split(/\s+/).filter((w) => w.length > 1 && !STOP.has(w)).map((w) => w.replace(/(es|s)$/, ''));
+  return new Set(t);
+}
+function sameFood(a, b) {
+  const ta = toks(a), tb = toks(b);
+  if (!ta.size || !tb.size) return a.toLowerCase() === b.toLowerCase();
+  let hit = 0;
+  ta.forEach((w) => { if (tb.has(w)) hit++; });
+  return hit / Math.min(ta.size, tb.size) >= 0.6;
+}
+const RANK = { low: 0, medium: 1, high: 2 };
+const NAME = ['low', 'medium', 'high'];
+
+// Two independent readings of the same photo: average what both saw, widen the range and lower
+// confidence where they disagree, and keep a food seen by only one reading as low confidence.
+function mergeRuns(A, B) {
+  const poolB = B.slice();
+  const out = [];
+  A.slice().sort((x, y) => y.grams - x.grams).forEach((a) => {
+    const j = poolB.findIndex((b) => sameFood(a.name, b.name));
+    if (j === -1) {
+      if (a.grams < 10) return;
+      out.push({ ...a, confidence: a.confidence === 'high' ? 'medium' : 'low', gramsLow: Math.max(1, Math.round(a.grams * 0.4)) });
+      return;
+    }
+    const b = poolB.splice(j, 1)[0];
+    const g = Math.round((a.grams + b.grams) / 2);
+    const ratio = Math.max(a.grams, b.grams) / Math.max(1, Math.min(a.grams, b.grams));
+    let r = Math.min(RANK[a.confidence], RANK[b.confidence]);
+    if (ratio > 1.5) r = 0; else if (ratio > 1.25) r = Math.min(r, 1);
+    out.push({
+      name: a.name,
+      grams: Math.min(MAX_ITEM_G, g),
+      gramsLow: Math.max(1, Math.min(a.gramsLow, b.gramsLow, Math.round(g * (ratio > 1.25 ? 0.85 : 1)))),
+      gramsHigh: Math.min(MAX_ITEM_G * 1.2, Math.max(a.gramsHigh, b.gramsHigh, Math.round(g * (ratio > 1.25 ? 1.15 : 1)))),
+      confidence: NAME[r],
+      basis: a.basis || b.basis,
+    });
+  });
+  poolB.forEach((b) => {
+    if (b.grams < 10) return;
+    out.push({ ...b, confidence: b.confidence === 'high' ? 'medium' : 'low', gramsLow: Math.max(1, Math.round(b.grams * 0.4)) });
+  });
+  return out;
 }
 
 function num(v) {
@@ -244,46 +335,20 @@ module.exports = async function handler(req, res) {
 
   try {
     // One automatic retry: a malformed or failed first response should not cost the member a re-shoot.
-    let parsed = await callModel();
+    // Accuracy: read the photo twice in parallel and average (skipped on a re-read that carries a prior estimate,
+    // which already anchors the portions). If one read fails, the other stands alone.
+    let parsed, second = null;
+    if (prior.length) {
+      parsed = await callModel();
+    } else {
+      const pair = await Promise.all([callModel(), callModel()]);
+      parsed = pair[0] || pair[1];
+      second = pair[0] && pair[1] ? pair[1] : null;
+    }
     if (!parsed) parsed = await callModel();
     if (!parsed) return res.status(502).json({ error: 'Could not read that photo' });
 
-    const seen = new Map();
-    (Array.isArray(parsed.foods) ? parsed.foods : []).forEach((f) => {
-      if (!f || typeof f.name !== 'string') return;
-      let g = num(f.grams);
-      if (!(g > 0)) return;
-      g = Math.min(MAX_ITEM_G, Math.round(g));
-      let lo = num(f.gramsLow);
-      let hi = num(f.gramsHigh);
-      if (!(lo > 0 && lo <= g)) lo = Math.max(1, Math.round(g * 0.75));
-      if (!(hi >= g)) hi = Math.round(g * 1.3);
-      lo = Math.round(Math.min(lo, g));
-      hi = Math.min(MAX_ITEM_G * 1.2, Math.round(Math.max(hi, g)));
-      const name = String(f.name).trim().slice(0, 80);
-      const key = name.toLowerCase();
-      let confidence = ['high', 'medium', 'low'].includes(f.confidence) ? f.confidence : 'medium';
-      const rec = reconcile(g, lo, hi, num(f.volumeMl), num(f.densityGml), confidence);
-      g = rec.g; lo = rec.lo; hi = rec.hi; confidence = rec.confidence;
-      const item = {
-        name,
-        grams: g,
-        gramsLow: lo,
-        gramsHigh: hi,
-        confidence,
-        basis: typeof f.basis === 'string' ? f.basis.slice(0, 80) : '',
-      };
-      // Merge exact duplicate names instead of listing the same food twice.
-      if (seen.has(key)) {
-        const prev = seen.get(key);
-        prev.grams = Math.min(MAX_ITEM_G, prev.grams + item.grams);
-        prev.gramsLow += item.gramsLow;
-        prev.gramsHigh += item.gramsHigh;
-      } else {
-        seen.set(key, item);
-      }
-    });
-    const foods = Array.from(seen.values()).sort((a, b) => b.grams - a.grams).slice(0, 14);
+    const foods = (second ? mergeRuns(cleanFoods(parsed), cleanFoods(second)) : cleanFoods(parsed)).sort((x, y) => y.grams - x.grams).slice(0, 14);
 
     let note = typeof parsed.note === 'string' ? parsed.note.slice(0, 200) : null;
     const questions = (Array.isArray(parsed.questions) ? parsed.questions : []).slice(0, 3).map((q) => ({
@@ -305,7 +370,8 @@ module.exports = async function handler(req, res) {
       foods,
       note,
       questions,
-      version: 4,
+      version: 5,
+      reads: second ? 2 : 1,
     });
   } catch (err) {
     console.error('analyze-food-photo error:', err);

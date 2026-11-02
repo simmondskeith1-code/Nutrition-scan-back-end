@@ -5,7 +5,11 @@
 // front end computes them from its database so numbers stay consistent with everything else
 // the user logs.
 //
-// Accuracy notes (v5): a fresh photo is read twice in parallel and the two readings are averaged; foods only one
+// Accuracy notes (v6): a fresh photo is read THREE times in parallel and the per-food median is used, so one wild read cannot move
+//   a number. A food seen by all reads keeps its confidence, one seen by two is capped at medium, one seen by a single read is low
+//   (and dropped when it is small). Each portion is then checked against a plausible ceiling for its type (a serving of oil, cheese,
+//   eggs, bread and so on), and anything over it is capped and flagged. Falls back to two reads, then one, if a read fails.
+// (v5 notes) Accuracy notes (v5): a fresh photo is read twice in parallel and the two readings are averaged; foods only one
 //   reading saw come back as low confidence; big disagreements widen the range. Re-reads with a prior stay single.
 // (v4 notes)
 // - v4: each solid item also returns a volume and density, and the server blends that weight with the
@@ -172,35 +176,79 @@ function sameFood(a, b) {
 const RANK = { low: 0, medium: 1, high: 2 };
 const NAME = ['low', 'medium', 'high'];
 
-// Two independent readings of the same photo: average what both saw, widen the range and lower
-// confidence where they disagree, and keep a food seen by only one reading as low confidence.
-function mergeRuns(A, B) {
-  const poolB = B.slice();
-  const out = [];
-  A.slice().sort((x, y) => y.grams - x.grams).forEach((a) => {
-    const j = poolB.findIndex((b) => sameFood(a.name, b.name));
-    if (j === -1) {
-      if (a.grams < 10) return;
-      out.push({ ...a, confidence: a.confidence === 'high' ? 'medium' : 'low', gramsLow: Math.max(1, Math.round(a.grams * 0.4)) });
-      return;
+// Plausible ceiling, in grams, for ONE item of this type in ONE meal. Over it is almost always a misread, not a real portion.
+const CAPS = [
+  [/\b(oil|butter|ghee|lard|mayo|mayonnaise|margarine)\b/, 60],
+  [/dressing|sauce|ketchup|syrup|salsa|dip\b|hummus|guacamole|gravy/, 200],
+  [/\bcheese\b/, 150],
+  [/\begg/, 360],
+  [/bacon/, 120],
+  [/sausage|hot dog|frankfurter/, 250],
+  [/bread|toast|bagel|\broll\b|\bbun\b|tortilla|wrap|pita|naan/, 200],
+  [/cereal|granola/, 150],
+  [/\bnuts?\b|almond|peanut|walnut|cashew|pecan|pistachio|seeds?\b/, 100],
+  [/chocolate|candy|cookie|cake|brownie|donut|doughnut|ice cream/, 250],
+  [/chicken|turkey|steak|beef|pork|lamb|salmon|tuna|fish|shrimp|burger|patty|ribs/, 600],
+  [/rice|pasta|noodle|quinoa|couscous|spaghetti|macaroni/, 650],
+  [/soda|cola|juice|milk|coffee|latte|smoothie|shake|beer|wine|tea\b/, 1000],
+];
+function capFor(name) {
+  const n = String(name).toLowerCase();
+  for (let i = 0; i < CAPS.length; i++) if (CAPS[i][0].test(n)) return CAPS[i][1];
+  return null;
+}
+function applyCaps(foods) {
+  const flagged = [];
+  foods.forEach((f) => {
+    const cap = capFor(f.name);
+    if (cap && f.grams > cap) {
+      const k = cap / f.grams;
+      f.gramsLow = Math.max(1, Math.round(Math.min(f.gramsLow, cap) * Math.min(1, k + 0.2)));
+      f.gramsHigh = Math.min(Math.round(cap * 1.2), f.gramsHigh);
+      f.grams = cap;
+      f.confidence = 'low';
+      flagged.push(f.name);
     }
-    const b = poolB.splice(j, 1)[0];
-    const g = Math.round((a.grams + b.grams) / 2);
-    const ratio = Math.max(a.grams, b.grams) / Math.max(1, Math.min(a.grams, b.grams));
-    let r = Math.min(RANK[a.confidence], RANK[b.confidence]);
-    if (ratio > 1.5) r = 0; else if (ratio > 1.25) r = Math.min(r, 1);
-    out.push({
-      name: a.name,
-      grams: Math.min(MAX_ITEM_G, g),
-      gramsLow: Math.max(1, Math.min(a.gramsLow, b.gramsLow, Math.round(g * (ratio > 1.25 ? 0.85 : 1)))),
-      gramsHigh: Math.min(MAX_ITEM_G * 1.2, Math.max(a.gramsHigh, b.gramsHigh, Math.round(g * (ratio > 1.25 ? 1.15 : 1)))),
-      confidence: NAME[r],
-      basis: a.basis || b.basis,
-    });
   });
-  poolB.forEach((b) => {
-    if (b.grams < 10) return;
-    out.push({ ...b, confidence: b.confidence === 'high' ? 'medium' : 'low', gramsLow: Math.max(1, Math.round(b.grams * 0.4)) });
+  return flagged;
+}
+
+// Several independent readings of the same photo. A food seen by every read keeps its confidence; seen by some but not all
+// is capped at medium; seen by one read only is low. The portion is the MEDIAN of the reads that saw it (the mean of the
+// middle two when even), and the range widens where the reads disagree.
+function consensus(reads) {
+  const n = reads.length, groups = [];
+  reads.forEach((foods, ri) => foods.forEach((f) => {
+    const grp = groups.find((g) => !g.seen.has(ri) && sameFood(g.name, f.name));
+    if (grp) { grp.items.push(f); grp.seen.add(ri); } else groups.push({ name: f.name, items: [f], seen: new Set([ri]) });
+  }));
+  const out = [];
+  groups.forEach((grp) => {
+    const gs = grp.items.map((i) => i.grams).sort((a, b) => a - b);
+    const mid = gs.length % 2 ? gs[(gs.length - 1) / 2] : (gs[gs.length / 2 - 1] + gs[gs.length / 2]) / 2;
+    const g = Math.min(MAX_ITEM_G, Math.round(mid));
+    const spread = gs[gs.length - 1] / Math.max(1, gs[0]);
+    let r = Math.min.apply(null, grp.items.map((i) => RANK[i.confidence]));
+    if (spread > 1.5) r = 0; else if (spread > 1.25) r = Math.min(r, 1);
+    const k = grp.items.length;
+    if (n > 1 && k < n) {
+      if (k === 1 && n >= 3 && g < 20) return; // one read in three saw a small item: treat it as noise
+      if (g < 10) return;
+      r = Math.min(r, k === 1 ? 0 : 1);
+    }
+    // An outlier read lowers confidence but does not stretch the range.
+    const inl = grp.items.filter((i) => i.grams / g <= 1.5 && g / i.grams <= 1.5);
+    const rng = inl.length ? inl : grp.items;
+    const best = grp.items.reduce((a, b) => (Math.abs(b.grams - g) < Math.abs(a.grams - g) ? b : a));
+    const wide = spread > 1.25;
+    out.push({
+      name: best.name,
+      grams: g,
+      gramsLow: Math.max(1, Math.min.apply(null, rng.map((i) => i.gramsLow).concat([Math.round(g * (wide ? 0.85 : 1)), k === 1 && n > 1 ? Math.round(g * 0.4) : g]))),
+      gramsHigh: Math.min(MAX_ITEM_G * 1.2, Math.max.apply(null, rng.map((i) => i.gramsHigh).concat([Math.round(g * (wide ? 1.15 : 1))]))),
+      confidence: NAME[r],
+      basis: best.basis || (grp.items.find((i) => i.basis) || {}).basis || '',
+    });
   });
   return out;
 }
@@ -337,20 +385,24 @@ module.exports = async function handler(req, res) {
     // One automatic retry: a malformed or failed first response should not cost the member a re-shoot.
     // Accuracy: read the photo twice in parallel and average (skipped on a re-read that carries a prior estimate,
     // which already anchors the portions). If one read fails, the other stands alone.
-    let parsed, second = null;
+    let parsed, good = [];
     if (prior.length) {
       parsed = await callModel();
+      if (parsed) good = [parsed];
     } else {
-      const pair = await Promise.all([callModel(), callModel()]);
-      parsed = pair[0] || pair[1];
-      second = pair[0] && pair[1] ? pair[1] : null;
+      const trio = await Promise.all([callModel(), callModel(), callModel()]);
+      good = trio.filter(Boolean);
+      parsed = good[0] || null;
     }
-    if (!parsed) parsed = await callModel();
+    if (!parsed) { parsed = await callModel(); if (parsed) good = [parsed]; }
     if (!parsed) return res.status(502).json({ error: 'Could not read that photo' });
 
-    const foods = (second ? mergeRuns(cleanFoods(parsed), cleanFoods(second)) : cleanFoods(parsed)).sort((x, y) => y.grams - x.grams).slice(0, 14);
+    const cleaned = good.map(cleanFoods);
+    const foods = (cleaned.length > 1 ? consensus(cleaned) : cleaned[0]).sort((x, y) => y.grams - x.grams).slice(0, 14);
+    const capped = applyCaps(foods);
 
     let note = typeof parsed.note === 'string' ? parsed.note.slice(0, 200) : null;
+    if (capped.length) note = (note ? note + ' ' : '') + 'That looked bigger than a normal serving, so ' + capped.slice(0, 2).join(' and ') + ' was capped. Check the grams.';
     const questions = (Array.isArray(parsed.questions) ? parsed.questions : []).slice(0, 3).map((q) => ({
       q: q && typeof q.q === 'string' ? q.q.trim().slice(0, 120) : '',
       options: Array.isArray(q && q.options) ? q.options.filter((o) => typeof o === 'string' && o.trim()).slice(0, 4).map((o) => o.trim().slice(0, 40)) : [],
@@ -370,11 +422,13 @@ module.exports = async function handler(req, res) {
       foods,
       note,
       questions,
-      version: 5,
-      reads: second ? 2 : 1,
+      version: 6,
+      reads: good.length,
     });
   } catch (err) {
     console.error('analyze-food-photo error:', err);
     return res.status(500).json({ error: 'Server error' });
   }
 };
+
+module.exports._test = { consensus, applyCaps, cleanFoods, capFor, sameFood };

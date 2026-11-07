@@ -12,7 +12,7 @@ const KEEP = ['field_title', 'field_recall_number', 'field_recall_date', 'field_
   'field_states', 'field_product_items', 'field_active_notice', 'field_recall_classification', 'field_risk_level'];
 
 module.exports = async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  if (require('../lib/guard').guard(req, res, { light: true })) return;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 25000);
   try {

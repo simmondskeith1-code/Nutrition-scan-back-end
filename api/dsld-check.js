@@ -4,7 +4,7 @@
 // Read only. Returns what the server saw, so a mismatch with the live API shows up here first.
 const D = require('../lib/dsld.js');
 module.exports = async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  if (require('../lib/guard').guard(req, res, { light: true })) return;
   const q = req.query || {};
   const out = { api: D.BASE };
   try {

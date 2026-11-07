@@ -180,7 +180,7 @@ function localSearch(query, loc) {
 }
 
 async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // tighten to your app's real origin once this is confirmed working
+  if (require('../lib/guard').guard(req, res, { light: true })) return;
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   if (req.method === 'OPTIONS') {
     res.status(200).end();

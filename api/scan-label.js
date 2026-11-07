@@ -12,7 +12,7 @@ module.exports.config = {
 
 module.exports = async function handler(req, res) {
   // Only allow requests from your actual site, not just anyone
-  res.setHeader('Access-Control-Allow-Origin', '*'); // tighten this to your domain before real launch, see note below
+  if (require('../lib/guard').guard(req, res)) return;
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
